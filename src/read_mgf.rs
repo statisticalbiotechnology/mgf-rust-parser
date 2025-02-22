@@ -11,6 +11,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
+use rayon::prelude::*; // Import Rayon’s parallel iterator traits
+
 /// A minimal struct for storing one MGF spectrum plus metadata.
 #[derive(Debug)]
 struct MgfSpectrum {
@@ -89,55 +91,54 @@ impl Iterator for MGFRecordBatchIter {
         }
         self.buffer.clear();
 
-        // Keep reading spectra until we fill `batch_size` or reach EOF.
+        // Read spectra until we fill a batch or hit EOF.
         while self.buffer.len() < self.batch_size {
             match read_one_spectrum(&mut self.reader, self.min_peaks) {
-                Ok(Some(spectrum)) => {
-                    self.buffer.push(spectrum);
-                }
+                Ok(Some(spectrum)) => self.buffer.push(spectrum),
                 Ok(None) => {
-                    // EOF or no more valid spectra
                     self.done = true;
                     break;
                 }
-                Err(_) => {
-                    // If parse error, skip. You could also `break` or handle differently.
-                    continue;
-                }
+                Err(_) => continue, // skip parse errors
             }
         }
-
         if self.buffer.is_empty() {
             return None;
         }
 
-        // Build arrays for each column from `self.buffer`
         let row_count = self.buffer.len();
 
-        let mut title_vals = Vec::with_capacity(row_count);
-        let mut scan_id_vals = Vec::with_capacity(row_count);
-        let mut pepmass_vals = Vec::with_capacity(row_count);
-        let mut rt_vals = Vec::with_capacity(row_count);
-        let mut charge_vals = Vec::with_capacity(row_count);
-        let mut seq_vals = Vec::with_capacity(row_count);
-        let mut scans_vals = Vec::with_capacity(row_count);
+        // Build each column in parallel.
+        let title_vals: Vec<Option<String>> = self
+            .buffer
+            .par_iter()
+            .map(|spec| spec.title.clone())
+            .collect();
+        let scan_id_vals: Vec<Option<i32>> =
+            self.buffer.par_iter().map(|spec| spec.scan_id).collect();
+        let pepmass_vals: Vec<Option<f64>> =
+            self.buffer.par_iter().map(|spec| spec.pepmass).collect();
+        let rt_vals: Vec<Option<f64>> = self
+            .buffer
+            .par_iter()
+            .map(|spec| spec.rtinseconds)
+            .collect();
+        let charge_vals: Vec<Option<i16>> =
+            self.buffer.par_iter().map(|spec| spec.charge).collect();
+        let seq_vals: Vec<Option<String>> = self
+            .buffer
+            .par_iter()
+            .map(|spec| spec.seq.clone())
+            .collect();
+        let scans_vals: Vec<Option<i32>> = self.buffer.par_iter().map(|spec| spec.scans).collect();
+        let all_mz: Vec<Vec<f64>> = self.buffer.par_iter().map(|spec| spec.mz.clone()).collect();
+        let all_intens: Vec<Vec<f64>> = self
+            .buffer
+            .par_iter()
+            .map(|spec| spec.intensity.clone())
+            .collect();
 
-        let mut all_mz: Vec<Vec<f64>> = Vec::with_capacity(row_count);
-        let mut all_intens: Vec<Vec<f64>> = Vec::with_capacity(row_count);
-
-        for spec in &self.buffer {
-            title_vals.push(spec.title.clone());
-            scan_id_vals.push(spec.scan_id);
-            pepmass_vals.push(spec.pepmass);
-            rt_vals.push(spec.rtinseconds);
-            charge_vals.push(spec.charge);
-            seq_vals.push(spec.seq.clone());
-            scans_vals.push(spec.scans);
-
-            all_mz.push(spec.mz.clone());
-            all_intens.push(spec.intensity.clone());
-        }
-
+        // Build Arrow arrays sequentially (builders are not thread-safe).
         let title_arr = StringArray::from(title_vals);
         let scan_id_arr = int32_nullable(&scan_id_vals);
         let pepmass_arr = f64_nullable(&pepmass_vals);
@@ -145,10 +146,10 @@ impl Iterator for MGFRecordBatchIter {
         let charge_arr = i16_nullable(&charge_vals);
         let seq_arr = StringArray::from(seq_vals);
         let scans_arr = int32_nullable(&scans_vals);
-
         let mz_list = build_list_array_f64(all_mz);
         let int_list = build_list_array_f64(all_intens);
 
+        // Construct the RecordBatch.
         let batch = RecordBatch::try_new(
             self.schema.clone(),
             vec![
