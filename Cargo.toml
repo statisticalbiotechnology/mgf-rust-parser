@@ -1,0 +1,12 @@
+[package]
+name = "mgf-rust-parser"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+lancedb = "0.7.0"
+arrow-array = "51.0.0"
+arrow-schema = "51.0.0"
+arrow = "51.0.0"          # for ArrowError and other public APIs
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
