@@ -1,91 +1,92 @@
-use arrow::error::ArrowError;
-use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchReader};
-use arrow_schema::{DataType, Field, Schema};
-use lancedb::connect;
-use std::sync::Arc;
-use tokio;
+mod read_mgf;
 
-/// A custom record batch reader that wraps an iterator yielding
-/// `Result<RecordBatch, ArrowError>`.
-struct MyRecordBatchReader<I> {
-    iter: I,
-    schema: Arc<Schema>,
-}
+use std::env;
+use std::error::Error;
+use std::time::Duration;
+use std::time::Instant;
 
-impl<I> MyRecordBatchReader<I> {
-    fn new(iter: I, schema: Arc<Schema>) -> Self {
-        Self { iter, schema }
+use arrow::record_batch::RecordBatch;
+use indicatif::{ProgressBar, ProgressStyle};
+
+/// Parse CLI arguments: <mgf_file> [batch_size] [min_peaks]
+fn parse_cli_args() -> Result<(String, usize, usize), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <mgf_file> [batch_size] [min_peaks]", args[0]);
+        std::process::exit(1);
     }
+
+    let mgf_path = args[1].clone();
+    let batch_size = if args.len() > 2 {
+        args[2]
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid batch_size: {}", args[2]))?
+    } else {
+        5 // default
+    };
+    let min_peaks = if args.len() > 3 {
+        args[3]
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid min_peaks: {}", args[3]))?
+    } else {
+        3 // default
+    };
+
+    Ok((mgf_path, batch_size, min_peaks))
 }
 
-impl<I> Iterator for MyRecordBatchReader<I>
+/// Processes the MGF iterator with a progress bar.
+/// Returns the total number of spectra read.
+fn process_batches_with_progress<I>(mut iter: I) -> Result<u64, Box<dyn Error>>
 where
-    I: Iterator<Item = Result<RecordBatch, ArrowError>>,
+    I: Iterator<Item = RecordBatch>,
 {
-    type Item = Result<RecordBatch, ArrowError>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
-    }
-}
-
-/// Implement the public trait `arrow_array::RecordBatchReader` for our custom reader.
-impl<I> arrow_array::RecordBatchReader for MyRecordBatchReader<I>
-where
-    I: Iterator<Item = Result<RecordBatch, ArrowError>>,
-{
-    fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to a local LanceDB database (the directory will be created if needed).
-    let db = connect("data/test.lance").execute().await?;
-
-    // Define a simple schema with two columns: an integer "id" and a "vector" column
-    // which is a fixed-size list of 128 Float32 values.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new(
-            "vector",
-            // FixedSizeList expects its inner field as an Arc<Field>.
-            // We create a Box<Field> and convert it using `.into()`.
-            DataType::FixedSizeList(
-                Box::new(Field::new("item", DataType::Float32, true)).into(),
-                128,
-            ),
-            true,
-        ),
-    ]));
-
-    // Create an Int32 array for the "id" column with 3 rows.
-    let id_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
-
-    // Create a FixedSizeList array for the "vector" column.
-    // Each row is a vector of 128 ones.
-    let vector_array = Arc::new(
-        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            (0..3).map(|_| Some(vec![Some(1.0_f32); 128])),
-            128,
-        ),
+    // Create and configure a spinner-style progress bar.
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+            .template("{spinner:.green} {msg}")
+            .expect("Failed to set progress bar template"),
     );
+    pb.enable_steady_tick(Duration::from_millis(100));
 
-    // Build a RecordBatch with the arrays and schema.
-    let batch = RecordBatch::try_new(schema.clone(), vec![id_array, vector_array])?;
+    let start = Instant::now();
+    let mut total_spectra: u64 = 0;
 
-    // Create an iterator that yields our single RecordBatch.
-    let batches = std::iter::once(Ok(batch));
+    // Iterate over batches, updating the progress bar.
+    while let Some(batch) = iter.next() {
+        let rows = batch.num_rows() as u64;
+        total_spectra += rows;
+        let elapsed = start.elapsed().as_secs_f64();
+        let rate = total_spectra as f64 / elapsed;
+        let msg = format!("{} spectra read ({:.2} per second)", total_spectra, rate);
+        // Leak the formatted string so it has a 'static lifetime.
+        let static_msg: &'static str = Box::leak(msg.into_boxed_str());
+        pb.set_message(static_msg);
+    }
 
-    // Wrap the iterator in our custom RecordBatchReader.
-    let my_reader = MyRecordBatchReader::new(batches, schema.clone());
+    let finish_msg = format!(
+        "Done: {} spectra read in {:.2} seconds.",
+        total_spectra,
+        start.elapsed().as_secs_f64()
+    );
+    let leaked: &'static mut str = Box::leak(finish_msg.into_boxed_str());
+    pb.finish_with_message(&*leaked);
 
-    // Create a table named "my_table" in the database with our test data.
-    db.create_table("my_table", Box::new(my_reader))
-        .execute()
-        .await?;
+    Ok(total_spectra)
+}
 
-    println!("Table 'my_table' created successfully with 3 rows.");
+fn main() -> Result<(), Box<dyn Error>> {
+    // Parse command-line arguments.
+    let (mgf_path, batch_size, min_peaks) = parse_cli_args()?;
+
+    // Create the MGF iterator from our module.
+    let iter = read_mgf::parse_mgf(&mgf_path, batch_size, min_peaks)?;
+
+    // Process batches with progress (the helper function encapsulates all progress logic).
+    let total = process_batches_with_progress(iter)?;
+
+    println!("Total spectra read: {}", total);
     Ok(())
 }
