@@ -17,10 +17,5 @@ clap = { version = "4", features = ["derive"] }
 
 
 [[bin]]
-name = "main"
+name = "mgf2lance"
 path = "src/main.rs"
-
-[[bin]]
-name = "read_mgf"
-path = "src/read_mgf.rs"
-
