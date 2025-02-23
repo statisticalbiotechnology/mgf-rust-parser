@@ -1,22 +1,22 @@
-mod read_mgf;
-
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use arrow_array::RecordBatchIterator; // Import from the crate root.
+use arrow_array::RecordBatchIterator; // from arrow_array v50.0.0
 use clap::{Parser, ValueHint};
 use indicatif::{ProgressBar, ProgressStyle};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 
-/// A simple CLI parser using Clap.
+mod read_mgf;
+
+/// CLI arguments using Clap.
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "Parse multiple MGF files (or directories) into Arrow RecordBatches and optionally write to a Lance dataset."
+    about = "Parse multiple MGF files (or directories) into Arrow RecordBatches and write to a Lance dataset."
 )]
 struct Cli {
     /// One or more MGF files or directories to parse. If a directory, recursively search for `.mgf` files.
@@ -42,14 +42,14 @@ struct Cli {
     #[arg(long, default_value = "8", help = "Channel capacity")]
     channel_capacity: usize,
 
-    /// Optional output path for the Lance dataset.
+    /// Output path for the Lance dataset. This argument is required.
     #[arg(
         long = "output-lance",
         value_hint = ValueHint::AnyPath,
         help = "Output Lance dataset path",
-        required = false
+        required = true
     )]
-    output_lance: Option<PathBuf>,
+    output_lance: PathBuf,
 }
 
 /// An adapter that wraps an iterator over RecordBatches and updates a progress bar.
@@ -90,7 +90,13 @@ where
         self.total += rows;
         let elapsed = self.start.elapsed().as_secs_f64();
         let rate = self.total as f64 / elapsed;
-        let msg = format!("{} spectra read ({:.2} per second)", self.total, rate);
+        let msg = format!(
+            "{} spectra read ({:.2} per second). Skipped: {} due to min_peaks, {} due to errors",
+            self.total,
+            rate,
+            read_mgf::SKIPPED_MIN.load(std::sync::atomic::Ordering::SeqCst),
+            read_mgf::SKIPPED_ERR.load(std::sync::atomic::Ordering::SeqCst)
+        );
         // Leak the string so it has a 'static lifetime.
         let static_msg: &'static str = Box::leak(msg.into_boxed_str());
         self.pb.set_message(static_msg);
@@ -101,9 +107,11 @@ where
 impl<I> Drop for ProgressRecordBatchIterator<I> {
     fn drop(&mut self) {
         let final_msg = format!(
-            "Done: {} spectra read in {:.2} seconds.",
+            "Done: {} spectra read in {:.2} seconds. Skipped: {} due to min_peaks, {} due to errors",
             self.total,
-            self.start.elapsed().as_secs_f64()
+            self.start.elapsed().as_secs_f64(),
+            read_mgf::SKIPPED_MIN.load(std::sync::atomic::Ordering::SeqCst),
+            read_mgf::SKIPPED_ERR.load(std::sync::atomic::Ordering::SeqCst)
         );
         let leaked: &'static str = Box::leak(final_msg.into_boxed_str());
         self.pb.finish_with_message(leaked);
@@ -116,49 +124,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     // 2) Create the MGF iterator from our read_mgf module.
-    let mut iter = read_mgf::parse_mgf_files(
+    let base_iter = read_mgf::parse_mgf_files(
         &cli.files,
         cli.batch_size,
         cli.min_peaks,
         cli.channel_capacity,
     )?;
 
-    // 3) If an output path is provided, write batches to a Lance dataset.
-    if let Some(lance_path) = cli.output_lance {
-        // To obtain the schema, take the first batch.
-        if let Some(first_batch) = iter.next() {
-            let schema = first_batch.schema();
-            // Create an iterator that yields the first batch, then the rest.
-            let full_iter = std::iter::once(first_batch).chain(iter);
-            // Wrap our iterator with the progress adapter.
-            let progress_iter = ProgressRecordBatchIterator::new(full_iter);
-            // Create a RecordBatchIterator (from arrow_array) as expected by Dataset::write.
-            let batch_iter = RecordBatchIterator::new(progress_iter.map(Ok), Arc::clone(&schema));
-            let write_params = WriteParams {
-                mode: WriteMode::Create, // Use WriteMode::Append if desired.
-                ..Default::default()
-            };
-            println!("Writing to Lance dataset at {}", lance_path.display());
-            Dataset::write(
-                batch_iter,
-                &lance_path.to_string_lossy(),
-                Some(write_params),
-            )
-            .await
-            .map_err(|e| format!("Failed to write Lance dataset: {e}"))?;
-            println!(
-                "Successfully wrote Lance dataset at {}",
-                lance_path.display()
-            );
-        } else {
-            println!("No data to write.");
+    // 3) Wrap the base iterator in a Peekable adapter to peek at the first batch without consuming it.
+    let mut peekable_iter = base_iter.peekable();
+    let schema = match peekable_iter.peek() {
+        Some(batch) => batch.schema().clone(),
+        None => {
+            eprintln!("No data found to write.");
+            return Ok(());
         }
-    } else {
-        // Otherwise, simply process all batches (with progress) to count spectra.
-        let progress_iter = ProgressRecordBatchIterator::new(iter);
-        let total: u64 = progress_iter.map(|b| b.num_rows() as u64).sum();
-        println!("Total spectra read: {}", total);
-    }
+    };
+
+    // 4) Wrap the iterator with our progress adapter.
+    let progress_iter = ProgressRecordBatchIterator::new(peekable_iter);
+
+    // 5) Build a RecordBatchIterator (expected by Lance) from our progress adapter.
+    let batch_iter = RecordBatchIterator::new(progress_iter.map(Ok), Arc::clone(&schema));
+    let write_params = WriteParams {
+        mode: WriteMode::Create, // or WriteMode::Append if desired
+        ..Default::default()
+    };
+
+    // 6) Write the batches to the Lance dataset.
+    println!("Writing to Lance dataset at {}", cli.output_lance.display());
+    Dataset::write(
+        batch_iter,
+        &cli.output_lance.to_string_lossy(),
+        Some(write_params),
+    )
+    .await
+    .map_err(|e| format!("Failed to write Lance dataset: {e}"))?;
+    println!(
+        "Successfully wrote Lance dataset at {}",
+        cli.output_lance.display()
+    );
+
+    // 7) Print the final skipped spectra counts.
+    println!(
+        "Skipped spectra: {} due to min_peaks, {} due to errors",
+        read_mgf::SKIPPED_MIN.load(std::sync::atomic::Ordering::SeqCst),
+        read_mgf::SKIPPED_ERR.load(std::sync::atomic::Ordering::SeqCst)
+    );
 
     Ok(())
 }
