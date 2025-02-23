@@ -24,14 +24,14 @@ fn parse_cli_args() -> Result<(String, usize, usize, usize), Box<dyn Error>> {
             .parse::<usize>()
             .map_err(|_| format!("Invalid batch_size: {}", args[2]))?
     } else {
-        5 // default
+        1000 // default
     };
     let min_peaks = if args.len() > 3 {
         args[3]
             .parse::<usize>()
             .map_err(|_| format!("Invalid min_peaks: {}", args[3]))?
     } else {
-        3 // default
+        1 // default
     };
     let channel_capacity = if args.len() > 4 {
         args[4]
