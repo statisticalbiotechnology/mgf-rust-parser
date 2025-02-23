@@ -2,17 +2,19 @@ mod read_mgf;
 
 use std::env;
 use std::error::Error;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// Parse CLI arguments: <mgf_file> [batch_size] [min_peaks]
-fn parse_cli_args() -> Result<(String, usize, usize), Box<dyn Error>> {
+/// Parse CLI arguments: <mgf_file> [batch_size] [min_peaks] [channel_capacity]
+fn parse_cli_args() -> Result<(String, usize, usize, usize), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <mgf_file> [batch_size] [min_peaks]", args[0]);
+        eprintln!(
+            "Usage: {} <mgf_file> [batch_size] [min_peaks] [channel_capacity]",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -31,8 +33,15 @@ fn parse_cli_args() -> Result<(String, usize, usize), Box<dyn Error>> {
     } else {
         3 // default
     };
+    let channel_capacity = if args.len() > 4 {
+        args[4]
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid channel_capacity: {}", args[4]))?
+    } else {
+        8 // default capacity
+    };
 
-    Ok((mgf_path, batch_size, min_peaks))
+    Ok((mgf_path, batch_size, min_peaks, channel_capacity))
 }
 
 /// Processes the MGF iterator with a progress bar.
@@ -79,14 +88,13 @@ where
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Parse command-line arguments.
-    let (mgf_path, batch_size, min_peaks) = parse_cli_args()?;
+    let (mgf_path, batch_size, min_peaks, channel_capacity) = parse_cli_args()?;
 
-    // Create the MGF iterator from our module.
-    let iter = read_mgf::parse_mgf(&mgf_path, batch_size, min_peaks)?;
+    // Create the MGF iterator from our module, now with `channel_capacity`.
+    let iter = read_mgf::parse_mgf(&mgf_path, batch_size, min_peaks, channel_capacity)?;
 
-    // Process batches with progress (the helper function encapsulates all progress logic).
+    // Process batches with a progress bar
     let total = process_batches_with_progress(iter)?;
 
-    println!("Total spectra read: {}", total);
     Ok(())
 }

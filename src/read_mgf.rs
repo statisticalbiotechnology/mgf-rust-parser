@@ -59,10 +59,17 @@ impl Iterator for MGFRecordBatchIter {
 /// Create a pipeline to parse an MGF file in one thread (producer)
 /// and build Arrow `RecordBatch` in another thread (consumer),
 /// returning an iterator that yields the final `RecordBatch`s.
+///
+/// - `mgf_path`: the input file
+/// - `batch_size`: how many spectra to buffer in one `Vec<MgfSpectrum>` before sending
+/// - `min_peaks`: ignore a spectrum if it has fewer than `min_peaks` peaks
+/// - `channel_capacity`: the bounded channel size (default 8). This sets how many
+///   in-flight batches we allow before the reading thread will block.
 pub fn parse_mgf<P: AsRef<Path>>(
     mgf_path: P,
     batch_size: usize,
     min_peaks: usize,
+    channel_capacity: usize, // newly added argument, default 8 if user doesn't override
 ) -> Result<MGFRecordBatchIter, ArrowError> {
     // Build a schema with columns for the metadata and peak arrays
     let schema = Arc::new(Schema::new(vec![
@@ -90,15 +97,14 @@ pub fn parse_mgf<P: AsRef<Path>>(
 
     // We'll create two channels:
     //  1) "batch_of_spectra" is from the reading thread to the building thread
-    //     Bounded to e.g. 10, so we won't blow up memory if the builder is slow
-    //  2) "record_batch" is from the building thread to the final iterator
+    //     Bounded by `channel_capacity`
+    //  2) "record_batch" is from the building thread to the final iterator,
+    //     also with the same or a separate channel capacity (here we set the same).
+    let (tx_spectra, rx_spectra) = bounded::<Vec<MgfSpectrum>>(channel_capacity);
+    let (tx_recordbatch, rx_recordbatch) = bounded::<Option<RecordBatch>>(channel_capacity);
 
-    let (tx_spectra, rx_spectra) = bounded::<Vec<MgfSpectrum>>(10);
-    let (tx_recordbatch, rx_recordbatch) = bounded::<Option<RecordBatch>>(10);
-
-    // We wrap the BufReader in a Mutex so that the reading thread can
-    // have exclusive access to it (not strictly necessary if we read in
-    // that thread only, but let's store it for clarity).
+    // We wrap the BufReader in a Mutex so the reading thread can have exclusive
+    // access to it. (We only read in the reading thread, so it's mostly for code clarity.)
     let reader = BufReader::new(file);
     let reader = Arc::new(Mutex::new(reader));
 
@@ -169,7 +175,6 @@ fn read_mgf_in_thread(
         }
     }
     // When done, close the channel by dropping tx_spectra
-    // but we do it explicitly here:
     drop(tx_spectra);
 
     Ok(())
@@ -190,19 +195,12 @@ fn build_batches_in_thread(
             continue;
         }
 
-        // Build each column in parallel
-        // We'll do minimal cloning: use from_iter to create arrays
-        let row_count = spectra_batch.len();
-
-        // For strings, we can do from_iter's "as_deref()" for Option<String>.
-        let title_arr = {
-            // parallel gather references
-            let opt_title_refs: Vec<Option<&str>> = spectra_batch
-                .par_iter()
-                .map(|spec| spec.title.as_deref())
-                .collect();
-            StringArray::from_iter(opt_title_refs)
-        };
+        // For strings, we can do from_iter referencing the existing string data
+        let opt_title_refs: Vec<Option<&str>> = spectra_batch
+            .par_iter()
+            .map(|spec| spec.title.as_deref())
+            .collect();
+        let title_arr = StringArray::from_iter(opt_title_refs);
 
         let scan_id_vals: Vec<Option<i32>> =
             spectra_batch.par_iter().map(|spec| spec.scan_id).collect();
@@ -218,19 +216,16 @@ fn build_batches_in_thread(
         let charge_vals: Vec<Option<i16>> =
             spectra_batch.par_iter().map(|spec| spec.charge).collect();
 
-        let seq_arr = {
-            let opt_seq_refs: Vec<Option<&str>> = spectra_batch
-                .par_iter()
-                .map(|spec| spec.seq.as_deref())
-                .collect();
-            StringArray::from_iter(opt_seq_refs)
-        };
+        let opt_seq_refs: Vec<Option<&str>> = spectra_batch
+            .par_iter()
+            .map(|spec| spec.seq.as_deref())
+            .collect();
+        let seq_arr = StringArray::from_iter(opt_seq_refs);
 
         let scans_vals: Vec<Option<i32>> =
             spectra_batch.par_iter().map(|spec| spec.scans).collect();
 
-        // For the "mz" and "intensity" columns, we do need to clone the Vec<f64>
-        // from each spectrum, but that's presumably required for building the final arrays.
+        // For the "mz" and "intensity" columns, we do clone the Vec<f64>
         let all_mz: Vec<Vec<f64>> = spectra_batch
             .par_iter()
             .map(|spec| spec.mz.clone())
@@ -386,15 +381,6 @@ fn read_one_spectrum(
     }
 }
 
-// -------------- Utility: parse optional scan_id from string --------------
-
-fn parse_scan_id(s: &str) -> Option<i32> {
-    // If you need, incorporate this into read_one_spectrum or do a separate prefix
-    // For brevity, omitted from the pipeline approach
-    // ...
-    None
-}
-
 // -------------- Utility: build arrow arrays --------------
 
 fn build_list_array_f64(data: Vec<Vec<f64>>) -> ArrayRef {
@@ -447,10 +433,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_size = 5;
     let min_peaks = 3;
 
-    // This sets up the parallel pipeline:
-    // reading in one thread, building in another,
-    // returning an MGFRecordBatchIter that yields final record batches
-    let mut iter = parse_mgf(mgf_path, batch_size, min_peaks)?;
+    // Default channel capacity = 8
+    let channel_capacity = 8;
+
+    // This sets up the parallel pipeline with bounding
+    let mut iter = parse_mgf(mgf_path, batch_size, min_peaks, channel_capacity)?;
 
     // Take the first batch, if any
     if let Some(first_batch) = iter.next() {
