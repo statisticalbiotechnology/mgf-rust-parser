@@ -1,100 +1,107 @@
 mod read_mgf;
 
-use std::env;
 use std::error::Error;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
+use clap::{Parser, ValueHint};
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// Parse CLI arguments: <mgf_file> [batch_size] [min_peaks] [channel_capacity]
-fn parse_cli_args() -> Result<(String, usize, usize, usize), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!(
-            "Usage: {} <mgf_file> [batch_size] [min_peaks] [channel_capacity]",
-            args[0]
-        );
-        std::process::exit(1);
-    }
+/// A simple CLI parser using Clap
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Parse multiple MGF files (or directories) into Arrow RecordBatches."
+)]
+struct Cli {
+    /// One or more MGF files or directories to parse. If a directory, we search
+    /// recursively for `.mgf` files.
+    ///
+    /// Example usage:
+    ///   --file path1.mgf --file /some/dir/with/mgfs
+    ///
+    #[arg(
+        short = 'f',
+        long = "file",
+        help = "MGF file(s) or directory(ies)",
+        value_hint = ValueHint::AnyPath,
+        num_args = 1..,
+        required = true
+    )]
+    files: Vec<PathBuf>,
 
-    let mgf_path = args[1].clone();
-    let batch_size = if args.len() > 2 {
-        args[2]
-            .parse::<usize>()
-            .map_err(|_| format!("Invalid batch_size: {}", args[2]))?
-    } else {
-        1000 // default
-    };
-    let min_peaks = if args.len() > 3 {
-        args[3]
-            .parse::<usize>()
-            .map_err(|_| format!("Invalid min_peaks: {}", args[3]))?
-    } else {
-        1 // default
-    };
-    let channel_capacity = if args.len() > 4 {
-        args[4]
-            .parse::<usize>()
-            .map_err(|_| format!("Invalid channel_capacity: {}", args[4]))?
-    } else {
-        8 // default capacity
-    };
+    /// The number of spectra to accumulate before building a RecordBatch
+    #[arg(long, default_value = "1000", help = "Batch size")]
+    batch_size: usize,
 
-    Ok((mgf_path, batch_size, min_peaks, channel_capacity))
+    /// Ignore any MGF spectrum with fewer than this many peaks
+    #[arg(long, default_value = "1", help = "Minimum peak count per spectrum")]
+    min_peaks: usize,
+
+    /// The size of the bounded channel used in the pipeline
+    #[arg(long, default_value = "8", help = "Channel capacity")]
+    channel_capacity: usize,
 }
 
-/// Processes the MGF iterator with a progress bar.
-/// Returns the total number of spectra read.
+fn main() -> Result<(), Box<dyn Error>> {
+    // 1) Parse CLI arguments with Clap
+    let cli = Cli::parse();
+
+    // 2) Create the MGF iterator from our `read_mgf` module.
+    //    This function can handle multiple input paths, building a combined list of all mgf files.
+    let iter = read_mgf::parse_mgf_files(
+        &cli.files, // the user-provided list of paths
+        cli.batch_size,
+        cli.min_peaks,
+        cli.channel_capacity,
+    )?;
+
+    // 3) Process all record batches with a progress bar
+    let total_spectra = process_batches_with_progress(iter)?;
+
+    println!("Total spectra read: {total_spectra}");
+    Ok(())
+}
+
+/// Processes record batches with a spinner-based progress bar.
+/// Returns the total number of spectra read across all RecordBatches.
 fn process_batches_with_progress<I>(mut iter: I) -> Result<u64, Box<dyn Error>>
 where
     I: Iterator<Item = RecordBatch>,
 {
-    // Create and configure a spinner-style progress bar.
+    // Create and configure a spinner
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
             .template("{spinner:.green} {msg}")
-            .expect("Failed to set progress bar template"),
+            .unwrap(),
     );
     pb.enable_steady_tick(Duration::from_millis(100));
 
     let start = Instant::now();
     let mut total_spectra: u64 = 0;
 
-    // Iterate over batches, updating the progress bar.
     while let Some(batch) = iter.next() {
         let rows = batch.num_rows() as u64;
         total_spectra += rows;
         let elapsed = start.elapsed().as_secs_f64();
         let rate = total_spectra as f64 / elapsed;
-        let msg = format!("{} spectra read ({:.2} per second)", total_spectra, rate);
-        // Leak the formatted string so it has a 'static lifetime.
+
+        // We must 'leak' the string to get a 'static lifetime for pb.set_message()
+        let msg = format!("{total_spectra} spectra read ({rate:.2} per second)");
         let static_msg: &'static str = Box::leak(msg.into_boxed_str());
         pb.set_message(static_msg);
     }
 
-    let finish_msg = format!(
-        "Done: {} spectra read in {:.2} seconds.",
-        total_spectra,
+    let final_msg = format!(
+        "Done: {total_spectra} spectra read in {:.2} seconds.",
         start.elapsed().as_secs_f64()
     );
-    let leaked: &'static mut str = Box::leak(finish_msg.into_boxed_str());
-    pb.finish_with_message(&*leaked);
+    let leaked_final: &'static str = Box::leak(final_msg.into_boxed_str());
+    pb.finish_with_message(leaked_final);
 
     Ok(total_spectra)
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    // Parse command-line arguments.
-    let (mgf_path, batch_size, min_peaks, channel_capacity) = parse_cli_args()?;
-
-    // Create the MGF iterator from our module, now with `channel_capacity`.
-    let iter = read_mgf::parse_mgf(&mgf_path, batch_size, min_peaks, channel_capacity)?;
-
-    // Process batches with a progress bar
-    let total = process_batches_with_progress(iter)?;
-
-    Ok(())
 }

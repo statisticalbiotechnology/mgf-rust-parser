@@ -1,6 +1,6 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -15,10 +15,32 @@ use arrow::record_batch::RecordBatch;
 use crossbeam::channel::{Receiver, Sender, bounded};
 use rayon::prelude::*;
 
-/// A minimal struct for storing one MGF spectrum plus metadata.
+/// This is the pipeline iterator we yield
+pub struct MGFRecordBatchIter {
+    rx_recordbatch: Receiver<Option<RecordBatch>>,
+    done: bool,
+}
+
+impl Iterator for MGFRecordBatchIter {
+    type Item = RecordBatch;
+    fn next(&mut self) -> Option<RecordBatch> {
+        if self.done {
+            return None;
+        }
+        match self.rx_recordbatch.recv().ok()? {
+            Some(batch) => Some(batch),
+            None => {
+                self.done = true;
+                None
+            }
+        }
+    }
+}
+
+/// A minimal struct for storing one MGF spectrum + metadata.
 #[derive(Debug)]
 struct MgfSpectrum {
-    // Metadata
+    filename: String, // which file it came from
     title: Option<String>,
     scan_id: Option<i32>,
     pepmass: Option<f64>,
@@ -27,52 +49,42 @@ struct MgfSpectrum {
     seq: Option<String>,
     scans: Option<i32>,
 
-    // Peak arrays
+    // peak data
     mz: Vec<f64>,
     intensity: Vec<f64>,
 }
 
-/// An iterator that yields `RecordBatch` objects from our pipeline.
-pub struct MGFRecordBatchIter {
-    rx_recordbatch: Receiver<Option<RecordBatch>>,
-    done: bool,
-}
-
-/// Return `Some(RecordBatch)` until the channel sends `None`.
-impl Iterator for MGFRecordBatchIter {
-    type Item = RecordBatch;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        match self.rx_recordbatch.recv().ok()? {
-            Some(batch) => Some(batch),
-            None => {
-                // no more data
-                self.done = true;
-                None
-            }
-        }
-    }
-}
-
-/// Create a pipeline to parse an MGF file in one thread (producer)
-/// and build Arrow `RecordBatch` in another thread (consumer),
-/// returning an iterator that yields the final `RecordBatch`s.
-///
-/// - `mgf_path`: the input file
-/// - `batch_size`: how many spectra to buffer in one `Vec<MgfSpectrum>` before sending
-/// - `min_peaks`: ignore a spectrum if it has fewer than `min_peaks` peaks
-/// - `channel_capacity`: the bounded channel size (default 8). This sets how many
-///   in-flight batches we allow before the reading thread will block.
-pub fn parse_mgf<P: AsRef<Path>>(
-    mgf_path: P,
+/// If the user provides multiple paths, each can be a file or a directory.
+/// This function:
+///  1) Collects all `.mgf` files from them
+///  2) Spawns reading + building threads
+///  3) Returns an iterator for the final RecordBatches
+pub fn parse_mgf_files(
+    paths: &[PathBuf],
     batch_size: usize,
     min_peaks: usize,
-    channel_capacity: usize, // newly added argument, default 8 if user doesn't override
+    channel_capacity: usize,
 ) -> Result<MGFRecordBatchIter, ArrowError> {
-    // Build a schema with columns for the metadata and peak arrays
+    // Gather all mgf files from each path
+    let mut mgf_files = Vec::new();
+    for p in paths {
+        let found = gather_mgf_files(p)?;
+        mgf_files.extend(found);
+    }
+    mgf_files.sort();
+
+    if mgf_files.is_empty() {
+        // Return an empty iterator
+        let (_tx, rx) = bounded::<Option<RecordBatch>>(1);
+        return Ok(MGFRecordBatchIter {
+            rx_recordbatch: rx,
+            done: false,
+        });
+    }
+
+    // Build schema (with "filename" + other columns)
     let schema = Arc::new(Schema::new(vec![
+        Field::new("filename", DataType::Utf8, false),
         Field::new("title", DataType::Utf8, true),
         Field::new("scan_id", DataType::Int32, true),
         Field::new("pepmass", DataType::Float64, true),
@@ -92,163 +104,170 @@ pub fn parse_mgf<P: AsRef<Path>>(
         ),
     ]));
 
-    // Attempt to open the file
-    let file = File::open(mgf_path).map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-
-    // We'll create two channels:
-    //  1) "batch_of_spectra" is from the reading thread to the building thread
-    //     Bounded by `channel_capacity`
-    //  2) "record_batch" is from the building thread to the final iterator,
-    //     also with the same or a separate channel capacity (here we set the same).
+    // Channel from reading => building
     let (tx_spectra, rx_spectra) = bounded::<Vec<MgfSpectrum>>(channel_capacity);
-    let (tx_recordbatch, rx_recordbatch) = bounded::<Option<RecordBatch>>(channel_capacity);
+    // Channel from building => final
+    let (tx_rb, rx_rb) = bounded::<Option<RecordBatch>>(channel_capacity);
 
-    // We wrap the BufReader in a Mutex so the reading thread can have exclusive
-    // access to it. (We only read in the reading thread, so it's mostly for code clarity.)
-    let reader = BufReader::new(file);
-    let reader = Arc::new(Mutex::new(reader));
-
-    // Spawn the reading thread
     {
-        let reader_clone = Arc::clone(&reader);
-        let tx_spectra_clone = tx_spectra.clone();
-
+        let files_clone = mgf_files.clone();
         thread::spawn(move || {
-            // This function reads MGF lines into Vec<MgfSpectrum> and sends them
-            if let Err(err) =
-                read_mgf_in_thread(reader_clone, batch_size, min_peaks, tx_spectra_clone)
+            if let Err(e) = read_all_mgfs_in_thread(files_clone, batch_size, min_peaks, tx_spectra)
             {
-                eprintln!("Error reading mgf: {:?}", err);
+                eprintln!("Error in reading thread: {e:?}");
             }
         });
     }
-
-    // Spawn the building thread
     {
         let schema_clone = Arc::clone(&schema);
         thread::spawn(move || {
-            build_batches_in_thread(rx_spectra, tx_recordbatch, schema_clone);
+            build_batches_in_thread(rx_spectra, tx_rb, schema_clone);
         });
     }
 
-    // The final MGFRecordBatchIter just yields from "rx_recordbatch"
     Ok(MGFRecordBatchIter {
-        rx_recordbatch,
+        rx_recordbatch: rx_rb,
         done: false,
     })
 }
 
-// ---------------- READING THREAD ----------------
+/// Recursively gather .mgf from a file or directory
+fn gather_mgf_files(path: &Path) -> Result<Vec<PathBuf>, ArrowError> {
+    let mut results = Vec::new();
+    if path.is_dir() {
+        // read sub
+        for entry in std::fs::read_dir(path).map_err(|e| ArrowError::ExternalError(Box::new(e)))? {
+            let entry = entry.map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+            let p = entry.path();
+            if p.is_dir() {
+                // recurse
+                let sub = gather_mgf_files(&p)?;
+                results.extend(sub);
+            } else {
+                if let Some(ext) = p.extension() {
+                    if ext.eq_ignore_ascii_case("mgf") {
+                        results.push(p);
+                    }
+                }
+            }
+        }
+    } else if path.is_file() {
+        // single file
+        if let Some(ext) = path.extension() {
+            if ext.eq_ignore_ascii_case("mgf") {
+                results.push(path.to_path_buf());
+            }
+        }
+    }
+    Ok(results)
+}
 
-/// Continuously read the file, building Vec<MgfSpectrum> until `batch_size` or EOF,
-/// then send them to `tx_spectra`. If we have leftover spectra smaller than batch_size
-/// at EOF, send them as well.
-fn read_mgf_in_thread(
-    reader: Arc<Mutex<BufReader<File>>>,
+/// Read all mgf files in order, parse spectra, batch them, send to building thread.
+fn read_all_mgfs_in_thread(
+    mgf_files: Vec<PathBuf>,
     batch_size: usize,
     min_peaks: usize,
     tx_spectra: Sender<Vec<MgfSpectrum>>,
 ) -> Result<(), ArrowError> {
     let mut buffer = Vec::with_capacity(batch_size);
 
-    loop {
-        let spectrum = {
-            // Lock the reader for each read operation
-            let mut guard = reader.lock().unwrap();
-            read_one_spectrum(&mut *guard, min_peaks)?
-        };
-        match spectrum {
-            Some(sp) => {
-                buffer.push(sp);
-                if buffer.len() == batch_size {
-                    tx_spectra.send(buffer).unwrap();
-                    buffer = Vec::with_capacity(batch_size);
+    for f in mgf_files {
+        let file = File::open(&f).map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        let mut reader = BufReader::new(file);
+
+        loop {
+            let sp = read_one_spectrum(&mut reader, min_peaks, &f)?;
+            match sp {
+                Some(s) => {
+                    buffer.push(s);
+                    if buffer.len() == batch_size {
+                        tx_spectra.send(buffer).unwrap();
+                        buffer = Vec::with_capacity(batch_size);
+                    }
                 }
-            }
-            None => {
-                // EOF or invalid
-                if !buffer.is_empty() {
-                    tx_spectra.send(buffer).unwrap();
+                None => {
+                    // means EOF in that file
+                    break;
                 }
-                break;
             }
         }
     }
-    // When done, close the channel by dropping tx_spectra
+    // leftover
+    if !buffer.is_empty() {
+        tx_spectra.send(buffer).unwrap();
+    }
+    // done
     drop(tx_spectra);
-
     Ok(())
 }
 
-// ---------------- BUILDING THREAD ----------------
-
-/// Receive Vec<MgfSpectrum> from the reading thread,
-/// build each as a `RecordBatch`, and send them out.
+/// Build the arrow RecordBatch from each Vec<MgfSpectrum>.
 fn build_batches_in_thread(
-    rx_spectra: Receiver<Vec<MgfSpectrum>>,
-    tx_recordbatch: Sender<Option<RecordBatch>>,
+    rx: Receiver<Vec<MgfSpectrum>>,
+    tx: Sender<Option<RecordBatch>>,
     schema: Arc<Schema>,
 ) {
-    while let Ok(spectra_batch) = rx_spectra.recv() {
-        // We received a batch of MgfSpectrum from the reading thread
-        if spectra_batch.is_empty() {
+    while let Ok(batch_of_spectra) = rx.recv() {
+        if batch_of_spectra.is_empty() {
             continue;
         }
 
-        // For strings, we can do from_iter referencing the existing string data
-        let opt_title_refs: Vec<Option<&str>> = spectra_batch
-            .par_iter()
-            .map(|spec| spec.title.as_deref())
+        // Extract columns
+        let filename_vals: Vec<&str> = batch_of_spectra
+            .iter()
+            .map(|sp| sp.filename.as_str())
             .collect();
-        let title_arr = StringArray::from_iter(opt_title_refs);
+
+        let opt_title_refs: Vec<Option<&str>> = batch_of_spectra
+            .par_iter()
+            .map(|sp| sp.title.as_deref())
+            .collect();
 
         let scan_id_vals: Vec<Option<i32>> =
-            spectra_batch.par_iter().map(|spec| spec.scan_id).collect();
-
+            batch_of_spectra.par_iter().map(|sp| sp.scan_id).collect();
         let pepmass_vals: Vec<Option<f64>> =
-            spectra_batch.par_iter().map(|spec| spec.pepmass).collect();
-
-        let rt_vals: Vec<Option<f64>> = spectra_batch
+            batch_of_spectra.par_iter().map(|sp| sp.pepmass).collect();
+        let rt_vals: Vec<Option<f64>> = batch_of_spectra
             .par_iter()
-            .map(|spec| spec.rtinseconds)
+            .map(|sp| sp.rtinseconds)
             .collect();
-
         let charge_vals: Vec<Option<i16>> =
-            spectra_batch.par_iter().map(|spec| spec.charge).collect();
+            batch_of_spectra.par_iter().map(|sp| sp.charge).collect();
 
-        let opt_seq_refs: Vec<Option<&str>> = spectra_batch
+        let opt_seq_refs: Vec<Option<&str>> = batch_of_spectra
             .par_iter()
-            .map(|spec| spec.seq.as_deref())
-            .collect();
-        let seq_arr = StringArray::from_iter(opt_seq_refs);
-
-        let scans_vals: Vec<Option<i32>> =
-            spectra_batch.par_iter().map(|spec| spec.scans).collect();
-
-        // For the "mz" and "intensity" columns, we do clone the Vec<f64>
-        let all_mz: Vec<Vec<f64>> = spectra_batch
-            .par_iter()
-            .map(|spec| spec.mz.clone())
+            .map(|sp| sp.seq.as_deref())
             .collect();
 
-        let all_intens: Vec<Vec<f64>> = spectra_batch
+        let scans_vals: Vec<Option<i32>> = batch_of_spectra.par_iter().map(|sp| sp.scans).collect();
+
+        // clone the peak arrays
+        let all_mz: Vec<Vec<f64>> = batch_of_spectra
             .par_iter()
-            .map(|spec| spec.intensity.clone())
+            .map(|sp| sp.mz.clone())
+            .collect();
+        let all_intens: Vec<Vec<f64>> = batch_of_spectra
+            .par_iter()
+            .map(|sp| sp.intensity.clone())
             .collect();
 
-        // Build final arrays
+        // Build Arrow arrays
+        let filename_arr = StringArray::from(filename_vals);
+        let title_arr = StringArray::from_iter(opt_title_refs);
         let scan_id_arr = int32_nullable(&scan_id_vals);
         let pepmass_arr = f64_nullable(&pepmass_vals);
         let rt_arr = f64_nullable(&rt_vals);
         let charge_arr = i16_nullable(&charge_vals);
+        let seq_arr = StringArray::from_iter(opt_seq_refs);
         let scans_arr = int32_nullable(&scans_vals);
+
         let mz_list = build_list_array_f64(all_mz);
         let int_list = build_list_array_f64(all_intens);
 
-        // Construct the RecordBatch
-        let batch = match RecordBatch::try_new(
+        let rb = match RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(filename_arr),
                 Arc::new(title_arr),
                 Arc::new(scan_id_arr),
                 Arc::new(pepmass_arr),
@@ -262,42 +281,39 @@ fn build_batches_in_thread(
         ) {
             Ok(b) => b,
             Err(_) => {
-                // if building fails, we can skip or send None
-                continue;
+                tx.send(None).ok();
+                return;
             }
         };
 
-        // Send the record batch along
-        tx_recordbatch.send(Some(batch)).unwrap();
+        tx.send(Some(rb)).ok();
     }
-
-    // no more input => send a final None to indicate end of stream
-    let _ = tx_recordbatch.send(None);
+    // no more input => send None
+    let _ = tx.send(None);
 }
 
-// ---------------- The read_one_spectrum function from before ----------------
-
+/// Read exactly one spectrum or return EOF if none. If the spectrum has < min_peaks, return None.
 fn read_one_spectrum(
     reader: &mut BufReader<File>,
     min_peaks: usize,
+    file_path: &Path, // so each spectrum knows which file
 ) -> Result<Option<MgfSpectrum>, ArrowError> {
-    // search for "BEGIN IONS"
+    // look for `BEGIN IONS`
     loop {
         let mut line = String::new();
-        let bytes_read = reader
+        let n = reader
             .read_line(&mut line)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-        if bytes_read == 0 {
-            // EOF
-            return Ok(None);
+        if n == 0 {
+            return Ok(None); // EOF
         }
-        let trimmed = line.trim();
-        if trimmed.starts_with("BEGIN IONS") {
+        if line.trim_start().starts_with("BEGIN IONS") {
             break;
         }
     }
 
-    let mut spec = MgfSpectrum {
+    let mut sp = MgfSpectrum {
+        filename: file_path.display().to_string(),
         title: None,
         scan_id: None,
         pepmass: None,
@@ -309,14 +325,14 @@ fn read_one_spectrum(
         intensity: Vec::new(),
     };
 
-    // Now parse lines until "END IONS"
+    // parse lines til END IONS
     loop {
         let mut line = String::new();
-        let bytes_read = reader
+        let n = reader
             .read_line(&mut line)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-        if bytes_read == 0 {
-            // EOF in the middle of a block
+        if n == 0 {
+            // EOF in the middle
             break;
         }
         let trimmed = line.trim();
@@ -324,82 +340,68 @@ fn read_one_spectrum(
             break;
         }
 
-        // Check for e.g. TITLE=, PEPMASS=, ...
         if let Some(val) = line.strip_prefix("TITLE=") {
-            let s = val.trim().to_string();
-            spec.title = Some(s.clone());
-
-            // Attempt to parse out scan=### from the Title
-            if let Some(scan_id) = parse_scan_id(&s) {
-                spec.scan_id = Some(scan_id);
+            let s = val.trim();
+            sp.title = Some(s.to_string());
+            // parse scan=## if present
+            if let Some(num) = parse_scan_id(s) {
+                sp.scan_id = Some(num);
             }
-            continue;
-        }
-        if let Some(val) = line.strip_prefix("PEPMASS=") {
+        } else if let Some(val) = line.strip_prefix("PEPMASS=") {
             let v = val.trim().split_whitespace().next().unwrap_or("");
-            if let Ok(pepmass) = v.parse::<f64>() {
-                spec.pepmass = Some(pepmass);
+            if let Ok(p) = v.parse::<f64>() {
+                sp.pepmass = Some(p);
             }
-            continue;
-        }
-        if let Some(val) = line.strip_prefix("RTINSECONDS=") {
-            if let Ok(rt) = val.trim().parse::<f64>() {
-                spec.rtinseconds = Some(rt);
+        } else if let Some(val) = line.strip_prefix("RTINSECONDS=") {
+            if let Ok(r) = val.trim().parse::<f64>() {
+                sp.rtinseconds = Some(r);
             }
-            continue;
-        }
-        if let Some(val) = line.strip_prefix("CHARGE=") {
+        } else if let Some(val) = line.strip_prefix("CHARGE=") {
             let mut s = val.trim().to_string();
             if s.ends_with('+') {
                 s.pop();
             }
             if let Ok(ch) = s.parse::<i16>() {
-                spec.charge = Some(ch);
+                sp.charge = Some(ch);
             }
-            continue;
-        }
-        if let Some(val) = line.strip_prefix("SCANS=") {
+        } else if let Some(val) = line.strip_prefix("SCANS=") {
             if let Ok(sc) = val.trim().parse::<i32>() {
-                spec.scans = Some(sc);
+                sp.scans = Some(sc);
             }
-            continue;
-        }
-        if let Some(val) = line.strip_prefix("SEQ=") {
-            spec.seq = Some(val.trim().to_string());
-            continue;
-        }
-
-        // Otherwise assume "mz intensity"
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let (Ok(mz_val), Ok(int_val)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                spec.mz.push(mz_val);
-                spec.intensity.push(int_val);
+        } else if let Some(val) = line.strip_prefix("SEQ=") {
+            sp.seq = Some(val.trim().to_string());
+        } else {
+            // parse mz intensity
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let (Ok(mz_val), Ok(int_val)) =
+                    (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+                {
+                    sp.mz.push(mz_val);
+                    sp.intensity.push(int_val);
+                }
             }
         }
     }
 
-    if spec.mz.len() < min_peaks {
+    if sp.mz.len() < min_peaks {
         Ok(None)
     } else {
-        Ok(Some(spec))
+        Ok(Some(sp))
     }
 }
 
-/// Attempt to parse an i32 from a string containing "scan=###" or "index=###" etc.
+/// Parse e.g. `scan=123` or `index=45`
 fn parse_scan_id(s: &str) -> Option<i32> {
-    // If the entire string is just a number, use that
     if let Ok(num) = s.parse::<i32>() {
         return Some(num);
     }
-    // Otherwise look for "scan="
     if let Some(idx) = s.find("scan=") {
         let substr = &s[idx + 5..];
         if let Ok(num) = substr.parse::<i32>() {
             return Some(num);
         }
     }
-    // Or "index="
     if let Some(idx) = s.find("index=") {
         let substr = &s[idx + 6..];
         if let Ok(num) = substr.parse::<i32>() {
@@ -409,7 +411,9 @@ fn parse_scan_id(s: &str) -> Option<i32> {
     None
 }
 
-// -------------- Utility: build arrow arrays --------------
+//-------------------------------------//
+//   Utility array-building functions   //
+//-------------------------------------//
 
 fn build_list_array_f64(data: Vec<Vec<f64>>) -> ArrayRef {
     let val_builder = Float64Builder::new();
@@ -422,62 +426,59 @@ fn build_list_array_f64(data: Vec<Vec<f64>>) -> ArrayRef {
 }
 
 fn int32_nullable(vals: &[Option<i32>]) -> Int32Array {
-    let mut builder = Int32Builder::new();
+    let mut b = Int32Builder::new();
     for v in vals {
         match v {
-            Some(x) => builder.append_value(*x),
-            None => builder.append_null(),
+            Some(x) => b.append_value(*x),
+            None => b.append_null(),
         };
     }
-    builder.finish()
+    b.finish()
 }
 
 fn i16_nullable(vals: &[Option<i16>]) -> Int16Array {
-    let mut builder = Int16Builder::new();
+    let mut b = Int16Builder::new();
     for v in vals {
         match v {
-            Some(x) => builder.append_value(*x),
-            None => builder.append_null(),
+            Some(x) => b.append_value(*x),
+            None => b.append_null(),
         };
     }
-    builder.finish()
+    b.finish()
 }
 
 fn f64_nullable(vals: &[Option<f64>]) -> Float64Array {
-    let mut builder = Float64Builder::new();
+    let mut b = Float64Builder::new();
     for v in vals {
         match v {
-            Some(x) => builder.append_value(*x),
-            None => builder.append_null(),
+            Some(x) => b.append_value(*x),
+            None => b.append_null(),
         };
     }
-    builder.finish()
+    b.finish()
 }
 
-// -------------- Example main for debugging --------------
+//-------------- Example debug main (optional) --------------//
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mgf_path = "tests/test.mgf";
+    // Minimal local test: read mgf(s) from CLI
+    // cargo run --bin read_mgf -- /some/dir/with/mgfs -- or single mgf
+    let args: Vec<String> = std::env::args().collect();
+    let path0 = args.get(1).cloned().unwrap_or(".".to_string());
+    let path1 = PathBuf::from(path0);
+
     let batch_size = 5;
     let min_peaks = 3;
-
-    // Default channel capacity = 8
     let channel_capacity = 8;
 
-    // This sets up the parallel pipeline with bounding
-    let mut iter = parse_mgf(mgf_path, batch_size, min_peaks, channel_capacity)?;
-
-    // Take the first batch, if any
-    if let Some(first_batch) = iter.next() {
-        println!("First RecordBatch has {} rows.", first_batch.num_rows());
-
-        // Slice down to row 0..1 so the pretty-printer only prints that single row:
-        let single_row = first_batch.slice(0, 1);
-        println!("First row from the first batch:");
-        println!("{:?}", &single_row);
+    let mut it = parse_mgf_files(&[path1], batch_size, min_peaks, channel_capacity)?;
+    if let Some(rb) = it.next() {
+        println!("Got first RecordBatch with {} rows.", rb.num_rows());
+        if rb.num_rows() > 0 {
+            println!("First row:\n{:?}", rb.slice(0, 1));
+        }
     } else {
-        println!("No batches produced from the MGF file.");
+        println!("No data found.");
     }
-
     Ok(())
 }
