@@ -1,26 +1,39 @@
 import lance
-import pyarrow as pa
 import pandas as pd
 
 
 def main():
-    # Open an existing Lance dataset.
-    # Replace "diffusiondb_train.lance" with the path to your Lance dataset.
-    _dataset = lance.dataset(
-        "/Users/alfred/Documents/Code/Rust/mgf-rust-parser/data/test.lance/my_table.lance"
+    # Open the Lance dataset
+    dataset = lance.dataset("data/output.lance")
+
+    # Read the first 5 rows as an Arrow Table
+    table = dataset.to_table(limit=5)
+
+    # Convert to Pandas DataFrame with Arrow types preserved
+    df = table.to_pandas(types_mapper=pd.ArrowDtype)
+
+    # Ensure that mz_array and intensity_array are treated as lists
+    df["mz_array"] = df["mz_array"].apply(
+        lambda x: list(x) if hasattr(x, "__iter__") else None
+    )
+    df["intensity_array"] = df["intensity_array"].apply(
+        lambda x: list(x) if hasattr(x, "__iter__") else None
     )
 
-    # Read the entire dataset as an Arrow Table.
-    table = _dataset.to_table()
+    # Compute array lengths
+    df["mz_array_length"] = df["mz_array"].apply(
+        lambda x: len(x) if isinstance(x, list) else None
+    )
+    df["intensity_array_length"] = df["intensity_array"].apply(
+        lambda x: len(x) if isinstance(x, list) else None
+    )
 
-    # Option 1: Pretty-print using Arrow's own formatting.
-    print("=== Arrow Table ===")
-    print(table)
-
-    # Option 2: Convert to a Pandas DataFrame for prettier output.
-    df = table.to_pandas()
-    print("\n=== Pandas DataFrame ===")
+    # Print DataFrame with array lengths
+    print("\n=== Pandas DataFrame (Top 5 Rows) ===")
     print(df)
+
+    print("\n=== Array Lengths ===")
+    print(df[["mz_array_length", "intensity_array_length"]])
 
 
 if __name__ == "__main__":

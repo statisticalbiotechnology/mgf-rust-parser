@@ -5,15 +5,16 @@ edition = "2024"
 
 
 [dependencies]
-lancedb = "0.7.0"
+lance = "0.10.10"
 arrow-array = "51.0.0"
 arrow-schema = "51.0.0"
-arrow = "51.0.0"          # for ArrowError and other public APIs
+arrow = "51.0.0"    
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 indicatif = "0.17"
 rayon = "1.6"
 crossbeam = "0.8"
 clap = { version = "4", features = ["derive"] }
+
 
 [[bin]]
 name = "main"
@@ -23,6 +24,3 @@ path = "src/main.rs"
 name = "read_mgf"
 path = "src/read_mgf.rs"
 
-[[bin]]
-name = "write_mgf"
-path = "src/write_mgf.rs"
