@@ -24,7 +24,7 @@ Clone the repository and build in release mode:
   --batch-size 1000 --min-peaks 1
 
 - **MGF Parsing Module:**  
-  The MGF parsing module `read_mgf::parse_mgf_files` returns an itor yielding Apache Arrow RecordBatches. This module can be used directly in other Rust projects. The RecordBatches include the fields: pepmass, rtinseconds, charge, seq (sequence), mz_array,intensity_array among others.
+  The MGF parsing module `read_mgf::parse_mgf_files` returns an iterator yielding Apache Arrow RecordBatches. This module can be used directly in other Rust projects. The RecordBatches include the fields: pepmass, rtinseconds, charge, seq (sequence), mz_array,intensity_array among others.
 
 - **Read resulting dataset with Python**
   The resulting Lance dataset can be easily loaded in Python using the Lance API (tested with pylance 0.10.10 on pip).
