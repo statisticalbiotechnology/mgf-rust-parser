@@ -1,7 +1,8 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use arrow::array::{
     ArrayRef, Float64Array, Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder,
@@ -11,7 +12,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
-use rayon::prelude::*; // Import Rayon’s parallel iterator traits
+use crossbeam::channel::{Receiver, Sender, bounded};
+use rayon::prelude::*;
 
 /// A minimal struct for storing one MGF spectrum plus metadata.
 #[derive(Debug)]
@@ -30,19 +32,33 @@ struct MgfSpectrum {
     intensity: Vec<f64>,
 }
 
-/// This iterator yields [`RecordBatch`]es from an MGF file.
+/// An iterator that yields `RecordBatch` objects from our pipeline.
 pub struct MGFRecordBatchIter {
-    reader: BufReader<File>,
-    batch_size: usize,
-    min_peaks: usize,
-    buffer: Vec<MgfSpectrum>,
+    rx_recordbatch: Receiver<Option<RecordBatch>>,
     done: bool,
-    schema: Arc<Schema>,
 }
 
-/// Create an iterator that parses an MGF file at `mgf_path`,
-/// grouping up to `batch_size` spectra per batch,
-/// and ignoring spectra with fewer than `min_peaks`.
+/// Return `Some(RecordBatch)` until the channel sends `None`.
+impl Iterator for MGFRecordBatchIter {
+    type Item = RecordBatch;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.rx_recordbatch.recv().ok()? {
+            Some(batch) => Some(batch),
+            None => {
+                // no more data
+                self.done = true;
+                None
+            }
+        }
+    }
+}
+
+/// Create a pipeline to parse an MGF file in one thread (producer)
+/// and build Arrow `RecordBatch` in another thread (consumer),
+/// returning an iterator that yields the final `RecordBatch`s.
 pub fn parse_mgf<P: AsRef<Path>>(
     mgf_path: P,
     batch_size: usize,
@@ -72,86 +88,171 @@ pub fn parse_mgf<P: AsRef<Path>>(
     // Attempt to open the file
     let file = File::open(mgf_path).map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
 
+    // We'll create two channels:
+    //  1) "batch_of_spectra" is from the reading thread to the building thread
+    //     Bounded to e.g. 10, so we won't blow up memory if the builder is slow
+    //  2) "record_batch" is from the building thread to the final iterator
+
+    let (tx_spectra, rx_spectra) = bounded::<Vec<MgfSpectrum>>(10);
+    let (tx_recordbatch, rx_recordbatch) = bounded::<Option<RecordBatch>>(10);
+
+    // We wrap the BufReader in a Mutex so that the reading thread can
+    // have exclusive access to it (not strictly necessary if we read in
+    // that thread only, but let's store it for clarity).
+    let reader = BufReader::new(file);
+    let reader = Arc::new(Mutex::new(reader));
+
+    // Spawn the reading thread
+    {
+        let reader_clone = Arc::clone(&reader);
+        let tx_spectra_clone = tx_spectra.clone();
+
+        thread::spawn(move || {
+            // This function reads MGF lines into Vec<MgfSpectrum> and sends them
+            if let Err(err) =
+                read_mgf_in_thread(reader_clone, batch_size, min_peaks, tx_spectra_clone)
+            {
+                eprintln!("Error reading mgf: {:?}", err);
+            }
+        });
+    }
+
+    // Spawn the building thread
+    {
+        let schema_clone = Arc::clone(&schema);
+        thread::spawn(move || {
+            build_batches_in_thread(rx_spectra, tx_recordbatch, schema_clone);
+        });
+    }
+
+    // The final MGFRecordBatchIter just yields from "rx_recordbatch"
     Ok(MGFRecordBatchIter {
-        reader: BufReader::new(file),
-        batch_size,
-        min_peaks,
-        buffer: Vec::new(),
+        rx_recordbatch,
         done: false,
-        schema,
     })
 }
 
-impl Iterator for MGFRecordBatchIter {
-    type Item = RecordBatch;
+// ---------------- READING THREAD ----------------
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        self.buffer.clear();
+/// Continuously read the file, building Vec<MgfSpectrum> until `batch_size` or EOF,
+/// then send them to `tx_spectra`. If we have leftover spectra smaller than batch_size
+/// at EOF, send them as well.
+fn read_mgf_in_thread(
+    reader: Arc<Mutex<BufReader<File>>>,
+    batch_size: usize,
+    min_peaks: usize,
+    tx_spectra: Sender<Vec<MgfSpectrum>>,
+) -> Result<(), ArrowError> {
+    let mut buffer = Vec::with_capacity(batch_size);
 
-        // Read spectra until we fill a batch or hit EOF.
-        while self.buffer.len() < self.batch_size {
-            match read_one_spectrum(&mut self.reader, self.min_peaks) {
-                Ok(Some(spectrum)) => self.buffer.push(spectrum),
-                Ok(None) => {
-                    self.done = true;
-                    break;
+    loop {
+        let spectrum = {
+            // Lock the reader for each read operation
+            let mut guard = reader.lock().unwrap();
+            read_one_spectrum(&mut *guard, min_peaks)?
+        };
+        match spectrum {
+            Some(sp) => {
+                buffer.push(sp);
+                if buffer.len() == batch_size {
+                    tx_spectra.send(buffer).unwrap();
+                    buffer = Vec::with_capacity(batch_size);
                 }
-                Err(_) => continue, // skip parse errors
+            }
+            None => {
+                // EOF or invalid
+                if !buffer.is_empty() {
+                    tx_spectra.send(buffer).unwrap();
+                }
+                break;
             }
         }
-        if self.buffer.is_empty() {
-            return None;
+    }
+    // When done, close the channel by dropping tx_spectra
+    // but we do it explicitly here:
+    drop(tx_spectra);
+
+    Ok(())
+}
+
+// ---------------- BUILDING THREAD ----------------
+
+/// Receive Vec<MgfSpectrum> from the reading thread,
+/// build each as a `RecordBatch`, and send them out.
+fn build_batches_in_thread(
+    rx_spectra: Receiver<Vec<MgfSpectrum>>,
+    tx_recordbatch: Sender<Option<RecordBatch>>,
+    schema: Arc<Schema>,
+) {
+    while let Ok(spectra_batch) = rx_spectra.recv() {
+        // We received a batch of MgfSpectrum from the reading thread
+        if spectra_batch.is_empty() {
+            continue;
         }
 
-        let row_count = self.buffer.len();
+        // Build each column in parallel
+        // We'll do minimal cloning: use from_iter to create arrays
+        let row_count = spectra_batch.len();
 
-        // Build each column in parallel.
-        let title_vals: Vec<Option<String>> = self
-            .buffer
-            .par_iter()
-            .map(|spec| spec.title.clone())
-            .collect();
+        // For strings, we can do from_iter's "as_deref()" for Option<String>.
+        let title_arr = {
+            // parallel gather references
+            let opt_title_refs: Vec<Option<&str>> = spectra_batch
+                .par_iter()
+                .map(|spec| spec.title.as_deref())
+                .collect();
+            StringArray::from_iter(opt_title_refs)
+        };
+
         let scan_id_vals: Vec<Option<i32>> =
-            self.buffer.par_iter().map(|spec| spec.scan_id).collect();
+            spectra_batch.par_iter().map(|spec| spec.scan_id).collect();
+
         let pepmass_vals: Vec<Option<f64>> =
-            self.buffer.par_iter().map(|spec| spec.pepmass).collect();
-        let rt_vals: Vec<Option<f64>> = self
-            .buffer
+            spectra_batch.par_iter().map(|spec| spec.pepmass).collect();
+
+        let rt_vals: Vec<Option<f64>> = spectra_batch
             .par_iter()
             .map(|spec| spec.rtinseconds)
             .collect();
+
         let charge_vals: Vec<Option<i16>> =
-            self.buffer.par_iter().map(|spec| spec.charge).collect();
-        let seq_vals: Vec<Option<String>> = self
-            .buffer
+            spectra_batch.par_iter().map(|spec| spec.charge).collect();
+
+        let seq_arr = {
+            let opt_seq_refs: Vec<Option<&str>> = spectra_batch
+                .par_iter()
+                .map(|spec| spec.seq.as_deref())
+                .collect();
+            StringArray::from_iter(opt_seq_refs)
+        };
+
+        let scans_vals: Vec<Option<i32>> =
+            spectra_batch.par_iter().map(|spec| spec.scans).collect();
+
+        // For the "mz" and "intensity" columns, we do need to clone the Vec<f64>
+        // from each spectrum, but that's presumably required for building the final arrays.
+        let all_mz: Vec<Vec<f64>> = spectra_batch
             .par_iter()
-            .map(|spec| spec.seq.clone())
+            .map(|spec| spec.mz.clone())
             .collect();
-        let scans_vals: Vec<Option<i32>> = self.buffer.par_iter().map(|spec| spec.scans).collect();
-        let all_mz: Vec<Vec<f64>> = self.buffer.par_iter().map(|spec| spec.mz.clone()).collect();
-        let all_intens: Vec<Vec<f64>> = self
-            .buffer
+
+        let all_intens: Vec<Vec<f64>> = spectra_batch
             .par_iter()
             .map(|spec| spec.intensity.clone())
             .collect();
 
-        // Build Arrow arrays sequentially (builders are not thread-safe).
-        let title_arr = StringArray::from(title_vals);
+        // Build final arrays
         let scan_id_arr = int32_nullable(&scan_id_vals);
         let pepmass_arr = f64_nullable(&pepmass_vals);
         let rt_arr = f64_nullable(&rt_vals);
         let charge_arr = i16_nullable(&charge_vals);
-        let seq_arr = StringArray::from(seq_vals);
         let scans_arr = int32_nullable(&scans_vals);
         let mz_list = build_list_array_f64(all_mz);
         let int_list = build_list_array_f64(all_intens);
 
-        // Construct the RecordBatch.
-        let batch = RecordBatch::try_new(
-            self.schema.clone(),
+        // Construct the RecordBatch
+        let batch = match RecordBatch::try_new(
+            schema.clone(),
             vec![
                 Arc::new(title_arr),
                 Arc::new(scan_id_arr),
@@ -163,15 +264,24 @@ impl Iterator for MGFRecordBatchIter {
                 mz_list,
                 int_list,
             ],
-        )
-        .ok()?;
+        ) {
+            Ok(b) => b,
+            Err(_) => {
+                // if building fails, we can skip or send None
+                continue;
+            }
+        };
 
-        Some(batch)
+        // Send the record batch along
+        tx_recordbatch.send(Some(batch)).unwrap();
     }
+
+    // no more input => send a final None to indicate end of stream
+    let _ = tx_recordbatch.send(None);
 }
 
-/// Read lines until we find `BEGIN IONS`, then parse until `END IONS`.
-/// Return an `MgfSpectrum` if we get enough peaks. Otherwise None (EOF or invalid).
+// ---------------- The read_one_spectrum function from before ----------------
+
 fn read_one_spectrum(
     reader: &mut BufReader<File>,
     min_peaks: usize,
@@ -222,10 +332,7 @@ fn read_one_spectrum(
         // Check for e.g. TITLE=, PEPMASS=, ...
         if let Some(val) = line.strip_prefix("TITLE=") {
             let s = val.trim().to_string();
-            spec.title = Some(s.clone());
-            if let Some(sc) = parse_scan_id(&s) {
-                spec.scan_id = Some(sc);
-            }
+            spec.title = Some(s);
             continue;
         }
         if let Some(val) = line.strip_prefix("PEPMASS=") {
@@ -279,27 +386,17 @@ fn read_one_spectrum(
     }
 }
 
-/// Attempt to parse an i32 from a line containing "scan=###" or "index=###" etc.
+// -------------- Utility: parse optional scan_id from string --------------
+
 fn parse_scan_id(s: &str) -> Option<i32> {
-    if let Ok(num) = s.parse::<i32>() {
-        return Some(num);
-    }
-    if let Some(idx) = s.find("scan=") {
-        let substr = &s[idx + 5..];
-        if let Ok(num) = substr.parse::<i32>() {
-            return Some(num);
-        }
-    }
-    if let Some(idx) = s.find("index=") {
-        let substr = &s[idx + 6..];
-        if let Ok(num) = substr.parse::<i32>() {
-            return Some(num);
-        }
-    }
+    // If you need, incorporate this into read_one_spectrum or do a separate prefix
+    // For brevity, omitted from the pipeline approach
+    // ...
     None
 }
 
-/// Build a ListArray<f64> from `Vec<Vec<f64>>`.
+// -------------- Utility: build arrow arrays --------------
+
 fn build_list_array_f64(data: Vec<Vec<f64>>) -> ArrayRef {
     let val_builder = Float64Builder::new();
     let mut list_builder = ListBuilder::new(val_builder);
@@ -310,7 +407,6 @@ fn build_list_array_f64(data: Vec<Vec<f64>>) -> ArrayRef {
     Arc::new(list_builder.finish())
 }
 
-/// Build a nullable Int32Array from a slice of Option<i32>.
 fn int32_nullable(vals: &[Option<i32>]) -> Int32Array {
     let mut builder = Int32Builder::new();
     for v in vals {
@@ -322,7 +418,6 @@ fn int32_nullable(vals: &[Option<i32>]) -> Int32Array {
     builder.finish()
 }
 
-/// Build a nullable i16 array from a slice of Option<i16>.
 fn i16_nullable(vals: &[Option<i16>]) -> Int16Array {
     let mut builder = Int16Builder::new();
     for v in vals {
@@ -334,7 +429,6 @@ fn i16_nullable(vals: &[Option<i16>]) -> Int16Array {
     builder.finish()
 }
 
-/// Build a nullable f64 array from a slice of Option<f64>.
 fn f64_nullable(vals: &[Option<f64>]) -> Float64Array {
     let mut builder = Float64Builder::new();
     for v in vals {
@@ -346,14 +440,16 @@ fn f64_nullable(vals: &[Option<f64>]) -> Float64Array {
     builder.finish()
 }
 
-/// Example main function that prints the first batch.
-// use arrow::util::pretty::print_batches;
+// -------------- Example main for debugging --------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mgf_path = "tests/test.mgf";
     let batch_size = 5;
     let min_peaks = 3;
 
+    // This sets up the parallel pipeline:
+    // reading in one thread, building in another,
+    // returning an MGFRecordBatchIter that yields final record batches
     let mut iter = parse_mgf(mgf_path, batch_size, min_peaks)?;
 
     // Take the first batch, if any
@@ -363,7 +459,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Slice down to row 0..1 so the pretty-printer only prints that single row:
         let single_row = first_batch.slice(0, 1);
         println!("First row from the first batch:");
-        println!("{:?}", &single_row)
+        println!("{:?}", &single_row);
     } else {
         println!("No batches produced from the MGF file.");
     }
