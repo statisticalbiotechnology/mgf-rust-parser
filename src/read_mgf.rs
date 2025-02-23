@@ -327,7 +327,12 @@ fn read_one_spectrum(
         // Check for e.g. TITLE=, PEPMASS=, ...
         if let Some(val) = line.strip_prefix("TITLE=") {
             let s = val.trim().to_string();
-            spec.title = Some(s);
+            spec.title = Some(s.clone());
+
+            // Attempt to parse out scan=### from the Title
+            if let Some(scan_id) = parse_scan_id(&s) {
+                spec.scan_id = Some(scan_id);
+            }
             continue;
         }
         if let Some(val) = line.strip_prefix("PEPMASS=") {
@@ -379,6 +384,29 @@ fn read_one_spectrum(
     } else {
         Ok(Some(spec))
     }
+}
+
+/// Attempt to parse an i32 from a string containing "scan=###" or "index=###" etc.
+fn parse_scan_id(s: &str) -> Option<i32> {
+    // If the entire string is just a number, use that
+    if let Ok(num) = s.parse::<i32>() {
+        return Some(num);
+    }
+    // Otherwise look for "scan="
+    if let Some(idx) = s.find("scan=") {
+        let substr = &s[idx + 5..];
+        if let Ok(num) = substr.parse::<i32>() {
+            return Some(num);
+        }
+    }
+    // Or "index="
+    if let Some(idx) = s.find("index=") {
+        let substr = &s[idx + 6..];
+        if let Ok(num) = substr.parse::<i32>() {
+            return Some(num);
+        }
+    }
+    None
 }
 
 // -------------- Utility: build arrow arrays --------------
