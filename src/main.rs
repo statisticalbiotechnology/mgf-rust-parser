@@ -5,11 +5,19 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::RecordBatchIterator; // from arrow_array v50.0.0
-use clap::{Parser, ValueHint};
+use clap::{Parser, ValueEnum, ValueHint};
 use indicatif::{ProgressBar, ProgressStyle};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 
 mod read_mgf;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum WriteModeOption {
+    Write,
+    Append,
+    Overwrite,
+}
 
 /// CLI arguments using Clap.
 #[derive(Parser, Debug)]
@@ -18,6 +26,7 @@ mod read_mgf;
     version,
     about = "Parse multiple MGF files (or directories) into Arrow RecordBatches and write to a Lance dataset."
 )]
+
 struct Cli {
     /// One or more MGF files or directories to parse. If a directory, recursively search for `.mgf` files.
     #[arg(
@@ -50,6 +59,9 @@ struct Cli {
         required = true
     )]
     output_lance: PathBuf,
+
+    #[arg(long, default_value = "write", value_enum)]
+    write_mode: WriteModeOption,
 }
 
 /// An adapter that wraps an iterator over RecordBatches and updates a progress bar.
@@ -146,8 +158,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 5) Build a RecordBatchIterator (expected by Lance) from our progress adapter.
     let batch_iter = RecordBatchIterator::new(progress_iter.map(Ok), Arc::clone(&schema));
+
+    let write_mode = match cli.write_mode {
+        WriteModeOption::Write => WriteMode::Create,
+        WriteModeOption::Append => WriteMode::Append,
+        WriteModeOption::Overwrite => WriteMode::Overwrite,
+    };
+
     let write_params = WriteParams {
-        mode: WriteMode::Create, // or WriteMode::Append if desired
+        mode: write_mode,
         ..Default::default()
     };
 

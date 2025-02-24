@@ -23,6 +23,12 @@ Clone the repository and build in release mode:
   mgf2lance  --file /path/to/mgfs --output-lance output.lance 
   --batch-size 1000 --min-peaks 1
 
+- The `--write-mode` option accepts one of the following values:
+
+  - `create` — Create a new dataset (fails if the dataset exists).
+  - `append` — Append to an existing dataset.
+  - `overwrite` — Overwrite the dataset as a new version (old versions are preserved for time‑travel).
+
 - **MGF Parsing Module:**  
   The MGF parsing module `read_mgf::parse_mgf_files` returns an iterator yielding Apache Arrow RecordBatches. This module can be used directly in other Rust projects. The RecordBatches include the fields: pepmass, rtinseconds, charge, seq (sequence), mz_array,intensity_array among others.
 
