@@ -1,15 +1,17 @@
 use std::error::Error;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use arrow_array::RecordBatchIterator; // from arrow_array v50.0.0
+use arrow_array::RecordBatchIterator; // from arrow_array v51.0.0
 use clap::{Parser, ValueEnum, ValueHint};
 use indicatif::{ProgressBar, ProgressStyle};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 
 mod read_mgf;
+use read_mgf::{MGFConfig, MGFRecordBatchIter, parse_mgf_files};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "lowercase")]
@@ -26,7 +28,6 @@ enum WriteModeOption {
     version,
     about = "Parse multiple MGF files (or directories) into Arrow RecordBatches and write to a Lance dataset."
 )]
-
 struct Cli {
     /// One or more MGF files or directories to parse. If a directory, recursively search for `.mgf` files.
     #[arg(
@@ -51,7 +52,7 @@ struct Cli {
     #[arg(long, default_value = "8", help = "Channel capacity")]
     channel_capacity: usize,
 
-    /// Output path for the Lance dataset. This argument is required.
+    /// Output path for the Lance dataset.
     #[arg(
         long = "output-lance",
         value_hint = ValueHint::AnyPath,
@@ -60,8 +61,18 @@ struct Cli {
     )]
     output_lance: PathBuf,
 
+    /// Write mode (case‑insensitive): write, append, or overwrite.
     #[arg(long, default_value = "write", value_enum)]
     write_mode: WriteModeOption,
+
+    /// Optional YAML file defining field prefixes (overrides defaults).
+    #[arg(
+        long = "fields-config",
+        value_hint = ValueHint::AnyPath,
+        help = "YAML configuration file for MGF field prefixes",
+        required = false
+    )]
+    fields_config: Option<PathBuf>,
 }
 
 /// An adapter that wraps an iterator over RecordBatches and updates a progress bar.
@@ -135,15 +146,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 1) Parse CLI arguments.
     let cli = Cli::parse();
 
-    // 2) Create the MGF iterator from our read_mgf module.
-    let base_iter = read_mgf::parse_mgf_files(
+    // 2) Load YAML configuration if provided; otherwise, use default configuration.
+    let config = if let Some(config_path) = cli.fields_config {
+        let contents = fs::read_to_string(&config_path)?;
+        serde_yaml::from_str::<MGFConfig>(&contents)?
+    } else {
+        MGFConfig {
+            title_prefix: "TITLE=".to_string(),
+            pepmass_prefix: "PEPMASS=".to_string(),
+            rtinseconds_prefix: "RTINSECONDS=".to_string(),
+            charge_prefix: "CHARGE=".to_string(),
+            scans_prefix: "SCANS=".to_string(),
+            seq_prefix: "SEQ=".to_string(),
+        }
+    };
+    let config = Arc::new(config);
+
+    // 3) Create the MGF iterator from our read_mgf module.
+    let base_iter = parse_mgf_files(
         &cli.files,
         cli.batch_size,
         cli.min_peaks,
         cli.channel_capacity,
+        Arc::clone(&config),
     )?;
 
-    // 3) Wrap the base iterator in a Peekable adapter to peek at the first batch without consuming it.
+    // 4) Wrap the iterator in a Peekable adapter to peek at the first batch (for obtaining schema)
     let mut peekable_iter = base_iter.peekable();
     let schema = match peekable_iter.peek() {
         Some(batch) => batch.schema().clone(),
@@ -153,12 +181,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // 4) Wrap the iterator with our progress adapter.
+    // 5) Wrap the iterator with our progress adapter.
     let progress_iter = ProgressRecordBatchIterator::new(peekable_iter);
 
-    // 5) Build a RecordBatchIterator (expected by Lance) from our progress adapter.
+    // 6) Build a RecordBatchIterator (as expected by Lance) from our progress adapter.
     let batch_iter = RecordBatchIterator::new(progress_iter.map(Ok), Arc::clone(&schema));
 
+    // 7) Set write mode according to the CLI argument.
     let write_mode = match cli.write_mode {
         WriteModeOption::Write => WriteMode::Create,
         WriteModeOption::Append => WriteMode::Append,
@@ -170,7 +199,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
 
-    // 6) Write the batches to the Lance dataset.
+    // 8) Write the batches to the Lance dataset.
     println!("Writing to Lance dataset at {}", cli.output_lance.display());
     Dataset::write(
         batch_iter,
@@ -184,7 +213,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cli.output_lance.display()
     );
 
-    // 7) Print the final skipped spectra counts.
+    // 9) Print the final skipped spectra counts.
     println!(
         "Skipped spectra: {} due to min_peaks, {} due to errors",
         read_mgf::SKIPPED_MIN.load(std::sync::atomic::Ordering::SeqCst),

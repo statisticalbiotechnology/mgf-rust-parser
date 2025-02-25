@@ -14,11 +14,37 @@ use arrow::record_batch::RecordBatch;
 
 use crossbeam::channel::{Receiver, Sender, bounded};
 use rayon::prelude::*;
+use serde::Deserialize;
+use serde_yaml;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Global counters for skipped spectra.
 pub static SKIPPED_MIN: AtomicUsize = AtomicUsize::new(0);
 pub static SKIPPED_ERR: AtomicUsize = AtomicUsize::new(0);
+
+/// Configuration for parsing MGF fields loaded from a YAML file.
+#[derive(Debug, Deserialize)]
+pub struct MGFConfig {
+    pub title_prefix: String,
+    pub pepmass_prefix: String,
+    pub rtinseconds_prefix: String,
+    pub charge_prefix: String,
+    pub scans_prefix: String,
+    pub seq_prefix: String,
+}
+
+impl Default for MGFConfig {
+    fn default() -> Self {
+        Self {
+            title_prefix: "TITLE=".to_string(),
+            pepmass_prefix: "PEPMASS=".to_string(),
+            rtinseconds_prefix: "RTINSECONDS=".to_string(),
+            charge_prefix: "CHARGE=".to_string(),
+            scans_prefix: "SCANS=".to_string(),
+            seq_prefix: "SEQ=".to_string(),
+        }
+    }
+}
 
 /// This is the pipeline iterator we yield.
 pub struct MGFRecordBatchIter {
@@ -64,13 +90,16 @@ struct MgfSpectrum {
 /// 1) Gathers all `.mgf` files from them,
 /// 2) Spawns the reading and building threads,
 /// 3) Returns an iterator for the final RecordBatches.
+///
+/// Note: The configuration for field prefixes is passed in via the `config` argument.
 pub fn parse_mgf_files(
     paths: &[PathBuf],
     batch_size: usize,
     min_peaks: usize,
     channel_capacity: usize,
+    fields_config: Arc<MGFConfig>,
 ) -> Result<MGFRecordBatchIter, ArrowError> {
-    // Gather all mgf files from each path.
+    // Gather all mgf files.
     let mut mgf_files = Vec::new();
     for p in paths {
         let found = gather_mgf_files(p)?;
@@ -114,9 +143,15 @@ pub fn parse_mgf_files(
 
     {
         let files_clone = mgf_files.clone();
+        let config_clone = Arc::clone(&fields_config);
         thread::spawn(move || {
-            if let Err(e) = read_all_mgfs_in_thread(files_clone, batch_size, min_peaks, tx_spectra)
-            {
+            if let Err(e) = read_all_mgfs_in_thread(
+                files_clone,
+                batch_size,
+                min_peaks,
+                tx_spectra,
+                config_clone,
+            ) {
                 eprintln!("Error in reading thread: {e:?}");
             }
         });
@@ -138,7 +173,7 @@ pub fn parse_mgf_files(
 fn gather_mgf_files(path: &Path) -> Result<Vec<PathBuf>, ArrowError> {
     let mut results = Vec::new();
     if path.is_dir() {
-        for entry in std::fs::read_dir(path).map_err(|e| ArrowError::ExternalError(Box::new(e)))? {
+        for entry in fs::read_dir(path).map_err(|e| ArrowError::ExternalError(Box::new(e)))? {
             let entry = entry.map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
             let p = entry.path();
             if p.is_dir() {
@@ -160,23 +195,24 @@ fn gather_mgf_files(path: &Path) -> Result<Vec<PathBuf>, ArrowError> {
     Ok(results)
 }
 
-/// Read all mgf files in order, parse spectra, batch them, and send them to the building thread.
+/// Read all mgf files, parse spectra, batch them, and send them to the building thread.
 fn read_all_mgfs_in_thread(
     mgf_files: Vec<PathBuf>,
     batch_size: usize,
     min_peaks: usize,
     tx_spectra: Sender<Vec<MgfSpectrum>>,
+    config: Arc<MGFConfig>,
 ) -> Result<(), ArrowError> {
     let mut buffer = Vec::with_capacity(batch_size);
 
     for f in mgf_files {
         let file = File::open(&f).map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
         let mut reader = BufReader::new(file);
+        let mut line_num = 0;
 
         loop {
-            match read_one_spectrum(&mut reader, min_peaks, &f) {
+            match read_one_spectrum(&mut reader, min_peaks, &f, &config, &mut line_num) {
                 Ok(Some(s)) => {
-                    // If the spectrum has fewer than min_peaks, count it and skip.
                     if s.mz.len() < min_peaks {
                         SKIPPED_MIN.fetch_add(1, Ordering::SeqCst);
                         continue;
@@ -187,13 +223,14 @@ fn read_all_mgfs_in_thread(
                         buffer = Vec::with_capacity(batch_size);
                     }
                 }
-                Ok(None) => {
-                    // EOF for this file.
-                    break;
-                }
+                Ok(None) => break, // EOF for this file.
                 Err(e) => {
                     SKIPPED_ERR.fetch_add(1, Ordering::SeqCst);
-                    eprintln!("Error parsing spectrum: {e}");
+                    eprintln!(
+                        "Error parsing spectrum in file {} at line {}: {e}",
+                        f.display(),
+                        line_num
+                    );
                     continue;
                 }
             }
@@ -221,7 +258,6 @@ fn build_batches_in_thread(
             .iter()
             .map(|sp| sp.filename.as_str())
             .collect();
-
         let title_arr =
             StringArray::from_iter(batch_of_spectra.iter().map(|sp| sp.title.as_deref()));
         let scan_id_vals: Vec<Option<i32>> = batch_of_spectra.iter().map(|sp| sp.scan_id).collect();
@@ -274,10 +310,14 @@ fn build_batches_in_thread(
 }
 
 /// Read exactly one spectrum from the given reader (for one file).
+/// Returns Ok(Some(MgfSpectrum)) if a spectrum is parsed,
+/// Ok(None) if EOF is reached.
 fn read_one_spectrum(
     reader: &mut BufReader<File>,
-    _min_peaks: usize, // min_peaks is checked in the reading thread
+    _min_peaks: usize, // Already checked in the reading thread.
     file_path: &Path,
+    config: &MGFConfig,
+    line_num: &mut usize,
 ) -> Result<Option<MgfSpectrum>, ArrowError> {
     // Look for "BEGIN IONS"
     loop {
@@ -285,6 +325,7 @@ fn read_one_spectrum(
         let n = reader
             .read_line(&mut line)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        *line_num += 1;
         if n == 0 {
             return Ok(None); // EOF
         }
@@ -293,6 +334,7 @@ fn read_one_spectrum(
         }
     }
 
+    let block_start = *line_num;
     let mut sp = MgfSpectrum {
         filename: file_path.display().to_string(),
         title: None,
@@ -312,6 +354,7 @@ fn read_one_spectrum(
         let n = reader
             .read_line(&mut line)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        *line_num += 1;
         if n == 0 {
             break; // EOF in the middle of a block.
         }
@@ -319,22 +362,22 @@ fn read_one_spectrum(
         if trimmed.starts_with("END IONS") {
             break;
         }
-        if let Some(val) = line.strip_prefix("TITLE=") {
+        if let Some(val) = line.trim_start().strip_prefix(&config.title_prefix) {
             let s = val.trim();
             sp.title = Some(s.to_string());
             if let Some(num) = parse_scan_id(s) {
                 sp.scan_id = Some(num);
             }
-        } else if let Some(val) = line.strip_prefix("PEPMASS=") {
+        } else if let Some(val) = line.trim_start().strip_prefix(&config.pepmass_prefix) {
             let v = val.trim().split_whitespace().next().unwrap_or("");
             if let Ok(p) = v.parse::<f64>() {
                 sp.pepmass = Some(p);
             }
-        } else if let Some(val) = line.strip_prefix("RTINSECONDS=") {
+        } else if let Some(val) = line.trim_start().strip_prefix(&config.rtinseconds_prefix) {
             if let Ok(r) = val.trim().parse::<f64>() {
                 sp.rtinseconds = Some(r);
             }
-        } else if let Some(val) = line.strip_prefix("CHARGE=") {
+        } else if let Some(val) = line.trim_start().strip_prefix(&config.charge_prefix) {
             let mut s = val.trim().to_string();
             if s.ends_with('+') {
                 s.pop();
@@ -342,11 +385,11 @@ fn read_one_spectrum(
             if let Ok(ch) = s.parse::<i16>() {
                 sp.charge = Some(ch);
             }
-        } else if let Some(val) = line.strip_prefix("SCANS=") {
+        } else if let Some(val) = line.trim_start().strip_prefix(&config.scans_prefix) {
             if let Ok(sc) = val.trim().parse::<i32>() {
                 sp.scans = Some(sc);
             }
-        } else if let Some(val) = line.strip_prefix("SEQ=") {
+        } else if let Some(val) = line.trim_start().strip_prefix(&config.seq_prefix) {
             sp.seq = Some(val.trim().to_string());
         } else {
             // Otherwise, assume "mz intensity"
@@ -362,6 +405,34 @@ fn read_one_spectrum(
         }
     }
 
+    // Check for missing required fields.
+    let mut missing_fields = Vec::new();
+    if sp.title.is_none() {
+        missing_fields.push(&config.title_prefix);
+    }
+    if sp.pepmass.is_none() {
+        missing_fields.push(&config.pepmass_prefix);
+    }
+    if sp.rtinseconds.is_none() {
+        missing_fields.push(&config.rtinseconds_prefix);
+    }
+    if sp.charge.is_none() {
+        missing_fields.push(&config.charge_prefix);
+    }
+    if sp.scans.is_none() {
+        missing_fields.push(&config.scans_prefix);
+    }
+    if sp.seq.is_none() {
+        missing_fields.push(&config.seq_prefix);
+    }
+    if !missing_fields.is_empty() {
+        println!(
+            "Warning: In file {} near line {}: missing fields: {:?}",
+            file_path.display(),
+            block_start,
+            missing_fields
+        );
+    }
     Ok(Some(sp))
 }
 
@@ -433,14 +504,25 @@ fn f64_nullable(vals: &[Option<f64>]) -> Float64Array {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path0 = args.get(1).cloned().unwrap_or(".".to_string());
+    let path0 = args.get(1).cloned().unwrap_or_else(|| ".".to_string());
     let path1 = PathBuf::from(path0);
 
     let batch_size = 5;
     let min_peaks = 3;
     let channel_capacity = 8;
 
-    let mut it = parse_mgf_files(&[path1], batch_size, min_peaks, channel_capacity)?;
+    let config = MGFConfig {
+        title_prefix: "TITLE=".to_string(),
+        pepmass_prefix: "PEPMASS=".to_string(),
+        rtinseconds_prefix: "RTINSECONDS=".to_string(),
+        charge_prefix: "CHARGE=".to_string(),
+        scans_prefix: "SCANS=".to_string(),
+        seq_prefix: "SEQ=".to_string(),
+    };
+
+    let config = Arc::new(config);
+
+    let mut it = parse_mgf_files(&[path1], batch_size, min_peaks, channel_capacity, config)?;
     if let Some(rb) = it.next() {
         println!("Got first RecordBatch with {} rows.", rb.num_rows());
         if rb.num_rows() > 0 {

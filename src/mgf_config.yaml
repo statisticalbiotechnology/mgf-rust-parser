@@ -1,0 +1,6 @@
+title_prefix: "TITLE="
+pepmass_prefix: "PEPMASS="
+rtinseconds_prefix: "RTINSECONDS="
+charge_prefix: "CHARGE="
+scans_prefix: "SCANS="
+seq_prefix: "SEQQQ="

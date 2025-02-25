@@ -14,7 +14,8 @@ indicatif = "0.17"
 rayon = "1.6"
 crossbeam = "0.8"
 clap = { version = "4", features = ["derive"] }
-
+serde = "1.0"
+serde_yaml = "0.9"
 
 [[bin]]
 name = "mgf2lance"
