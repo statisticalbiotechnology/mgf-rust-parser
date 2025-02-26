@@ -11,7 +11,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 
 mod read_mgf;
-use read_mgf::{MGFConfig, MGFRecordBatchIter, parse_mgf_files};
+use read_mgf::{MGFConfig, parse_mgf_files};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "lowercase")]
@@ -152,12 +152,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         serde_yaml::from_str::<MGFConfig>(&contents)?
     } else {
         MGFConfig {
-            title_prefix: "TITLE=".to_string(),
-            pepmass_prefix: "PEPMASS=".to_string(),
-            rtinseconds_prefix: "RTINSECONDS=".to_string(),
-            charge_prefix: "CHARGE=".to_string(),
-            scans_prefix: "SCANS=".to_string(),
-            seq_prefix: "SEQ=".to_string(),
+            title_prefix: Some("TITLE=".to_string()),
+            pepmass_prefix: Some("PEPMASS=".to_string()),
+            rtinseconds_prefix: Some("RTINSECONDS=".to_string()),
+            charge_prefix: Some("CHARGE=".to_string()),
+            scans_prefix: Some("SCANS=".to_string()),
+            seq_prefix: Some("SEQ=".to_string()),
         }
     };
     let config = Arc::new(config);

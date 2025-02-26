@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use arrow::array::{
@@ -13,9 +13,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
 use crossbeam::channel::{Receiver, Sender, bounded};
-use rayon::prelude::*;
 use serde::Deserialize;
-use serde_yaml;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Global counters for skipped spectra.
@@ -23,25 +21,26 @@ pub static SKIPPED_MIN: AtomicUsize = AtomicUsize::new(0);
 pub static SKIPPED_ERR: AtomicUsize = AtomicUsize::new(0);
 
 /// Configuration for parsing MGF fields loaded from a YAML file.
+/// Each field prefix is optional; if set to None, that field is not required.
 #[derive(Debug, Deserialize)]
 pub struct MGFConfig {
-    pub title_prefix: String,
-    pub pepmass_prefix: String,
-    pub rtinseconds_prefix: String,
-    pub charge_prefix: String,
-    pub scans_prefix: String,
-    pub seq_prefix: String,
+    pub title_prefix: Option<String>,
+    pub pepmass_prefix: Option<String>,
+    pub rtinseconds_prefix: Option<String>,
+    pub charge_prefix: Option<String>,
+    pub scans_prefix: Option<String>,
+    pub seq_prefix: Option<String>,
 }
 
 impl Default for MGFConfig {
     fn default() -> Self {
         Self {
-            title_prefix: "TITLE=".to_string(),
-            pepmass_prefix: "PEPMASS=".to_string(),
-            rtinseconds_prefix: "RTINSECONDS=".to_string(),
-            charge_prefix: "CHARGE=".to_string(),
-            scans_prefix: "SCANS=".to_string(),
-            seq_prefix: "SEQ=".to_string(),
+            title_prefix: Some("TITLE=".to_string()),
+            pepmass_prefix: Some("PEPMASS=".to_string()),
+            rtinseconds_prefix: Some("RTINSECONDS=".to_string()),
+            charge_prefix: Some("CHARGE=".to_string()),
+            scans_prefix: Some("SCANS=".to_string()),
+            seq_prefix: Some("SEQ=".to_string()),
         }
     }
 }
@@ -77,7 +76,7 @@ struct MgfSpectrum {
     pepmass: Option<f64>,
     rtinseconds: Option<f64>,
     charge: Option<i16>,
-    seq: Option<String>,
+    sequence: Option<String>,
     scans: Option<i32>,
 
     // Peak data
@@ -91,7 +90,7 @@ struct MgfSpectrum {
 /// 2) Spawns the reading and building threads,
 /// 3) Returns an iterator for the final RecordBatches.
 ///
-/// Note: The configuration for field prefixes is passed in via the `config` argument.
+/// Note: The configuration for field prefixes is passed in via the `fields_config` argument.
 pub fn parse_mgf_files(
     paths: &[PathBuf],
     batch_size: usize,
@@ -123,7 +122,7 @@ pub fn parse_mgf_files(
         Field::new("pepmass", DataType::Float64, true),
         Field::new("rtinseconds", DataType::Float64, true),
         Field::new("charge", DataType::Int16, true),
-        Field::new("seq", DataType::Utf8, true),
+        Field::new("sequence", DataType::Utf8, true),
         Field::new("scans", DataType::Int32, true),
         Field::new(
             "mz_array",
@@ -264,7 +263,8 @@ fn build_batches_in_thread(
         let pepmass_vals: Vec<Option<f64>> = batch_of_spectra.iter().map(|sp| sp.pepmass).collect();
         let rt_vals: Vec<Option<f64>> = batch_of_spectra.iter().map(|sp| sp.rtinseconds).collect();
         let charge_vals: Vec<Option<i16>> = batch_of_spectra.iter().map(|sp| sp.charge).collect();
-        let seq_arr = StringArray::from_iter(batch_of_spectra.iter().map(|sp| sp.seq.as_deref()));
+        let seq_arr =
+            StringArray::from_iter(batch_of_spectra.iter().map(|sp| sp.sequence.as_deref()));
         let scans_vals: Vec<Option<i32>> = batch_of_spectra.iter().map(|sp| sp.scans).collect();
 
         let all_mz: Vec<Vec<f64>> = batch_of_spectra.iter().map(|sp| sp.mz.clone()).collect();
@@ -310,8 +310,7 @@ fn build_batches_in_thread(
 }
 
 /// Read exactly one spectrum from the given reader (for one file).
-/// Returns Ok(Some(MgfSpectrum)) if a spectrum is parsed,
-/// Ok(None) if EOF is reached.
+/// Returns Ok(Some(MgfSpectrum)) if a spectrum is parsed, Ok(None) if EOF is reached.
 fn read_one_spectrum(
     reader: &mut BufReader<File>,
     _min_peaks: usize, // Already checked in the reading thread.
@@ -342,7 +341,7 @@ fn read_one_spectrum(
         pepmass: None,
         rtinseconds: None,
         charge: None,
-        seq: None,
+        sequence: None,
         scans: None,
         mz: Vec::new(),
         intensity: Vec::new(),
@@ -362,68 +361,85 @@ fn read_one_spectrum(
         if trimmed.starts_with("END IONS") {
             break;
         }
-        if let Some(val) = line.trim_start().strip_prefix(&config.title_prefix) {
-            let s = val.trim();
-            sp.title = Some(s.to_string());
-            if let Some(num) = parse_scan_id(s) {
-                sp.scan_id = Some(num);
-            }
-        } else if let Some(val) = line.trim_start().strip_prefix(&config.pepmass_prefix) {
-            let v = val.trim().split_whitespace().next().unwrap_or("");
-            if let Ok(p) = v.parse::<f64>() {
-                sp.pepmass = Some(p);
-            }
-        } else if let Some(val) = line.trim_start().strip_prefix(&config.rtinseconds_prefix) {
-            if let Ok(r) = val.trim().parse::<f64>() {
-                sp.rtinseconds = Some(r);
-            }
-        } else if let Some(val) = line.trim_start().strip_prefix(&config.charge_prefix) {
-            let mut s = val.trim().to_string();
-            if s.ends_with('+') {
-                s.pop();
-            }
-            if let Ok(ch) = s.parse::<i16>() {
-                sp.charge = Some(ch);
-            }
-        } else if let Some(val) = line.trim_start().strip_prefix(&config.scans_prefix) {
-            if let Ok(sc) = val.trim().parse::<i32>() {
-                sp.scans = Some(sc);
-            }
-        } else if let Some(val) = line.trim_start().strip_prefix(&config.seq_prefix) {
-            sp.seq = Some(val.trim().to_string());
-        } else {
-            // Otherwise, assume "mz intensity"
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let (Ok(mz_val), Ok(int_val)) =
-                    (parts[0].parse::<f64>(), parts[1].parse::<f64>())
-                {
-                    sp.mz.push(mz_val);
-                    sp.intensity.push(int_val);
+        // For each field, check if the prefix is provided; if so, use it.
+        if let Some(prefix) = &config.title_prefix {
+            if let Some(val) = line.trim_start().strip_prefix(prefix) {
+                let s = val.trim();
+                sp.title = Some(s.to_string());
+                if let Some(num) = parse_scan_id(s) {
+                    sp.scan_id = Some(num);
                 }
+            }
+        }
+        if let Some(prefix) = &config.pepmass_prefix {
+            if let Some(val) = line.trim_start().strip_prefix(prefix) {
+                let v = val.trim().split_whitespace().next().unwrap_or("");
+                if let Ok(p) = v.parse::<f64>() {
+                    sp.pepmass = Some(p);
+                }
+            }
+        }
+        if let Some(prefix) = &config.rtinseconds_prefix {
+            if let Some(val) = line.trim_start().strip_prefix(prefix) {
+                if let Ok(r) = val.trim().parse::<f64>() {
+                    sp.rtinseconds = Some(r);
+                }
+            }
+        }
+        if let Some(prefix) = &config.charge_prefix {
+            if let Some(val) = line.trim_start().strip_prefix(prefix) {
+                let mut s = val.trim().to_string();
+                if s.ends_with('+') {
+                    s.pop();
+                }
+                if let Ok(ch) = s.parse::<i16>() {
+                    sp.charge = Some(ch);
+                }
+            }
+        }
+        if let Some(prefix) = &config.scans_prefix {
+            if let Some(val) = line.trim_start().strip_prefix(prefix) {
+                if let Ok(sc) = val.trim().parse::<i32>() {
+                    sp.scans = Some(sc);
+                }
+            }
+        }
+        if let Some(prefix) = &config.seq_prefix {
+            if let Some(val) = line.trim_start().strip_prefix(prefix) {
+                sp.sequence = Some(val.trim().to_string());
+            }
+        } else {
+            // If no seq_prefix is provided, you may decide to treat the sequence as optional.
+        }
+        // Otherwise, assume "mz intensity"
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() >= 2 {
+            if let (Ok(mz_val), Ok(int_val)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                sp.mz.push(mz_val);
+                sp.intensity.push(int_val);
             }
         }
     }
 
-    // Check for missing required fields.
+    // Check for missing required fields ONLY if the corresponding prefix is provided.
     let mut missing_fields = Vec::new();
-    if sp.title.is_none() {
-        missing_fields.push(&config.title_prefix);
+    if config.title_prefix.is_some() && sp.title.is_none() {
+        missing_fields.push(config.title_prefix.as_deref().unwrap());
     }
-    if sp.pepmass.is_none() {
-        missing_fields.push(&config.pepmass_prefix);
+    if config.pepmass_prefix.is_some() && sp.pepmass.is_none() {
+        missing_fields.push(config.pepmass_prefix.as_deref().unwrap());
     }
-    if sp.rtinseconds.is_none() {
-        missing_fields.push(&config.rtinseconds_prefix);
+    if config.rtinseconds_prefix.is_some() && sp.rtinseconds.is_none() {
+        missing_fields.push(config.rtinseconds_prefix.as_deref().unwrap());
     }
-    if sp.charge.is_none() {
-        missing_fields.push(&config.charge_prefix);
+    if config.charge_prefix.is_some() && sp.charge.is_none() {
+        missing_fields.push(config.charge_prefix.as_deref().unwrap());
     }
-    if sp.scans.is_none() {
-        missing_fields.push(&config.scans_prefix);
+    if config.scans_prefix.is_some() && sp.scans.is_none() {
+        missing_fields.push(config.scans_prefix.as_deref().unwrap());
     }
-    if sp.seq.is_none() {
-        missing_fields.push(&config.seq_prefix);
+    if config.seq_prefix.is_some() && sp.sequence.is_none() {
+        missing_fields.push(config.seq_prefix.as_deref().unwrap());
     }
     if !missing_fields.is_empty() {
         println!(
@@ -512,12 +528,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channel_capacity = 8;
 
     let config = MGFConfig {
-        title_prefix: "TITLE=".to_string(),
-        pepmass_prefix: "PEPMASS=".to_string(),
-        rtinseconds_prefix: "RTINSECONDS=".to_string(),
-        charge_prefix: "CHARGE=".to_string(),
-        scans_prefix: "SCANS=".to_string(),
-        seq_prefix: "SEQ=".to_string(),
+        title_prefix: Some("TITLE=".to_string()),
+        pepmass_prefix: Some("PEPMASS=".to_string()),
+        rtinseconds_prefix: Some("RTINSECONDS=".to_string()),
+        charge_prefix: Some("CHARGE=".to_string()),
+        scans_prefix: Some("SCANS=".to_string()),
+        seq_prefix: Some("SEQ=".to_string()),
     };
 
     let config = Arc::new(config);
