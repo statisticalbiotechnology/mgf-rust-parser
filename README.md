@@ -6,7 +6,7 @@ mgf‑rust‑parser is a Rust‑based tool that parses mass spectrometry MGF fil
 
 Clone the repository and build in release mode:
 
-  `git clone git@github.com:Alfred-N/mgf-rust-parser.git`
+  `git clone git@github.com:statisticalbiotechnology/mgf-rust-parser.git`
 
   `cd mgf-rust-parser`
 
