@@ -21,7 +21,7 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/software/sse/manual/GCC/12.
 
 - Set the PROTOC environment variable:
 Add this line to your bashrc:
-export PROTOC=/proj/bedrock/users/x_alfni/downloads/protoc/bin/protoc
+export PROTOC=/path/to/protoc/bin/protoc
 
 Then, after reloading your bashrc, verify with:
 echo $PROTOC
